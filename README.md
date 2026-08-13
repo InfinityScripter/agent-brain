@@ -19,6 +19,11 @@ belong in this folder?**
   project, workspace, skills, and workflows an agent will receive there.
 - **Collision radar and health checks** — find same-name skills and broken
   references before they surprise an agent mid-task.
+- **Onboarding skill** — `skills/brain-onboarding` lets your agent populate a
+  fresh registry from your real projects: discover, propose a plan, register
+  after your approval, then verify with a walk test.
+- **Relations map** — `brain build` generates a Markdown map of domains,
+  project relations, and workflows at `~/.agent-brain/reports/relations.md`.
 - **Local-first** — plain JSON and Markdown registry in `~/.agent-brain`;
   nothing leaves your machine.
 
@@ -60,6 +65,13 @@ The starter registry intentionally contains domains but no invented projects.
 Open **Projects → Add project** to register each work or personal folder; its
 local `AGENTS.md`, `CLAUDE.md`, and project skill roots are then linked into the
 same graph without copying their contents.
+
+To let an agent do that mapping for you, install
+[`skills/brain-onboarding`](skills/brain-onboarding/SKILL.md) into your agent
+runtime (for Claude Code: copy or symlink the folder into `~/.claude/skills/`)
+and ask it to "map my projects". The skill discovers projects on disk, shows a
+plan for your approval, registers everything through the `brain` CLI, and
+finishes with a walk test plus the generated relations map.
 
 ## Run from source
 
@@ -129,6 +141,7 @@ The private registry is plain JSON and Markdown:
 ├── workflows/**/*.json
 ├── data/inventory.json       # generated
 ├── reports/audit.md          # generated
+├── reports/relations.md      # generated relations map
 ├── state/                    # local override
 └── views/                    # generated dashboard/canvas
 ```

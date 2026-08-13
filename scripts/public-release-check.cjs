@@ -8,7 +8,7 @@ const publicEntries = [
   '.github', '.gitignore', 'AGENTS.md', 'CONTRIBUTING.md', 'LICENSE', 'README.md',
   'SECURITY.md', 'THIRD_PARTY_NOTICES.md', 'Open Agent Brain.command', 'adapters', 'assets', 'bin', 'brain.py',
   'core', 'defaults', 'desktop', 'docs', 'electron', 'forge.config.cjs', 'package-lock.json',
-  'package.json', 'registry', 'scripts', 'tests', 'web'
+  'package.json', 'registry', 'scripts', 'skills', 'tests', 'web'
 ];
 const privateRoots = ['.runtime-cache', 'config', 'data', 'domains', 'node_modules', 'out', 'projects', 'reports', 'state', 'views', 'workflows'];
 const textExtensions = new Set(['', '.cjs', '.css', '.html', '.json', '.md', '.py', '.sh', '.toml', '.txt', '.yml', '.yaml']);

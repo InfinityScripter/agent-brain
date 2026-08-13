@@ -112,6 +112,37 @@ class AgentBrainCliTests(unittest.TestCase):
             second_data = json.loads(second_manifest.read_text(encoding="utf-8"))
             self.assertEqual(second_data["related_projects"], [])
 
+    def test_build_generates_relations_map(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            registry = home / ".agent-brain"
+            first = home / "Projects" / "first"
+            second = home / "Projects" / "second"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            self.assertEqual(self.run_brain(home, registry, "init").returncode, 0)
+            self.assertEqual(self.run_brain(home, registry, "project", "add", str(first), "--domain", "personal.software").returncode, 0)
+            self.assertEqual(self.run_brain(home, registry, "project", "add", str(second), "--domain", "personal.software").returncode, 0)
+            related = self.run_brain(
+                home, registry, "project", "update", "second",
+                "--relations-json", '[{"project": "first", "type": "uses"}]'
+            )
+            self.assertEqual(related.returncode, 0, related.stderr)
+            workflow = self.run_brain(
+                home, registry, "workflow", "save", "release", "--name", "Release",
+                "--domain", "personal.software", "--steps-json", '["global.review"]'
+            )
+            self.assertEqual(workflow.returncode, 0, workflow.stderr)
+
+            built = self.run_brain(home, registry, "build")
+            self.assertEqual(built.returncode, 0, built.stderr)
+            relations = (registry / "reports" / "relations.md").read_text(encoding="utf-8")
+            self.assertIn("second -- uses --> first", relations)
+            self.assertIn("- `second` **uses** `first`", relations)
+            self.assertIn("(`personal.software`)", relations)
+            self.assertIn("`first`", relations)
+            self.assertIn("(personal.software): `global.review`", relations)
+
     def test_domain_workflow_and_skill_scope_crud(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
