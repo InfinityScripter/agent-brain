@@ -1,0 +1,8 @@
+{
+  "id": "work",
+  "name": "Work",
+  "description": "Professional projects, operations, research, and team collaboration.",
+  "color": "#46A7FF",
+  "icon": "briefcase",
+  "parent": null
+}

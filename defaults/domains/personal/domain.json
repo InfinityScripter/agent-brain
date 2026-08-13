@@ -1,0 +1,8 @@
+{
+  "id": "personal",
+  "name": "Personal",
+  "description": "Personal responsibilities, learning, wellbeing, and independent decisions.",
+  "color": "#F3B64B",
+  "icon": "home",
+  "parent": null
+}

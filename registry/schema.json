@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-brain.registry.v1",
+  "title": "Agent Brain Registry",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "registry",
+    "domains",
+    "projects",
+    "workflows",
+    "skills",
+    "collisions",
+    "instructions"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "agent-brain.registry.v1"
+    },
+    "generated_at": {
+      "type": "string"
+    },
+    "registry": {
+      "type": "string"
+    },
+    "config": {
+      "type": "object"
+    },
+    "domains": {
+      "type": "array"
+    },
+    "projects": {
+      "type": "array"
+    },
+    "workflows": {
+      "type": "array"
+    },
+    "skills": {
+      "type": "array"
+    },
+    "collisions": {
+      "type": "array"
+    },
+    "instructions": {
+      "type": "array"
+    }
+  },
+  "additionalProperties": true
+}

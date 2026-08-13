@@ -1,0 +1,8 @@
+{
+  "id": "meta.agent-system",
+  "name": "Meta · Agent System",
+  "description": "Codex, Claude, shared skills, hooks, and Agent Brain itself.",
+  "color": "#8068E8",
+  "icon": "cpu",
+  "parent": "meta"
+}

@@ -1,0 +1,37 @@
+{
+  "name": "agent-brain-desktop",
+  "productName": "Agent Brain",
+  "version": "1.0.0",
+  "description": "Local-first context control plane for AI-agent skills, projects, and worktrees.",
+  "main": "electron/main.cjs",
+  "author": "InfinityScripter",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/InfinityScripter/agent-brain.git"
+  },
+  "bugs": {
+    "url": "https://github.com/InfinityScripter/agent-brain/issues"
+  },
+  "homepage": "https://github.com/InfinityScripter/agent-brain#readme",
+  "scripts": {
+    "start": "electron-forge start",
+    "test": "node --test electron/test/*.test.cjs",
+    "test:python": "python3 -m unittest discover -s tests -v",
+    "test:public": "node scripts/public-release-check.cjs",
+    "test:package": "node electron/package-smoke.cjs",
+    "prepare:python": "node scripts/prepare-python-runtime.cjs",
+    "package": "electron-forge package",
+    "package:universal": "npm run prepare:python && electron-forge package --arch=universal",
+    "make": "electron-forge make",
+    "make:universal": "npm run prepare:python && electron-forge make --arch=universal"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "7.11.2",
+    "@electron-forge/maker-dmg": "7.11.2",
+    "@electron-forge/plugin-fuses": "7.11.2",
+    "@electron/fuses": "1.8.0",
+    "electron": "43.4.0"
+  }
+}

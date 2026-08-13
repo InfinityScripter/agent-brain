@@ -1,0 +1,178 @@
+# Agent Brain
+
+Agent Brain is a local-first control plane for AI-agent instructions, skills,
+projects, worktrees, and life/work contexts. It gives Codex, Claude, and other
+agent runtimes one deterministic answer to: **which rules and capabilities
+belong in this folder?**
+
+![Agent Brain desktop](docs/screenshot.png)
+
+## Why
+
+Agent runtimes can mount many skills globally even when those skills belong to
+one project or one area of life. That creates accidental conflicts. Agent Brain
+models physical installation separately from logical ownership and gives the
+runtime explicit routing guidance:
+
+- `global` — safe across unrelated tasks;
+- `domain` — work, personal, creative, or any domain you define;
+- `project` — owned by one repository or product;
+- `plugin` — supplied by an installed plugin and activated explicitly;
+- `archive` — visible for diagnostics, never selected automatically.
+
+The same registry powers the CLI, runtime hooks, validation, visual graph, and
+the sandboxed Electron application.
+
+## Install on macOS
+
+Download the universal DMG from [GitHub Releases](https://github.com/InfinityScripter/agent-brain/releases).
+It runs on both Apple Silicon and Intel Macs.
+
+The DMG includes its own pinned Python runtime for both architectures. The
+current community build is ad-hoc signed but not Apple-notarized. On first launch, Control-click Agent
+Brain in Finder, choose **Open**, then confirm **Open**. This uses macOS's normal
+per-app approval flow; do not disable Gatekeeper or remove quarantine globally.
+
+On first launch the app creates a private registry at `~/.agent-brain` and
+discovers skills from the standard shared, Codex, and Claude locations. The
+desktop app and CLI do not upload registry data: paths, manifests, and generated
+inventory remain on your machine. Opt-in hooks add the runtime, active domain,
+project/workspace identifiers, resolution source and scope chain, up to five
+active collision names, and registered workflow IDs to the prompt context
+processed by that runtime; they do not include filesystem or registry paths.
+
+The starter registry intentionally contains domains but no invented projects.
+Open **Projects → Add project** to register each work or personal folder; its
+local `AGENTS.md`, `CLAUDE.md`, and project skill roots are then linked into the
+same graph without copying their contents.
+
+## Run from source
+
+Requirements: macOS 12+, Python 3.9+, Node.js 20+. The DMG bundles Python and
+does not require a separate Python installation.
+
+```bash
+git clone https://github.com/InfinityScripter/agent-brain.git
+cd agent-brain
+npm ci
+./bin/brain init
+npm start
+```
+
+Register a project:
+
+```bash
+./bin/brain project add ~/Projects/my-app \
+  --domain personal.software \
+  --description "My application"
+```
+
+Agent Brain detects `AGENTS.md`, `CLAUDE.md`, and project-local skill roots.
+You can further edit the generated manifest under
+`~/.agent-brain/projects/<project>.json` to describe relations and worktrees.
+
+## CLI
+
+```bash
+./bin/brain init
+./bin/brain build
+./bin/brain status --cwd /path/to/project
+./bin/brain explain <skill-name-or-id> --cwd /path/to/project
+./bin/brain validate
+./bin/brain use personal
+./bin/brain use auto
+./bin/brain serve
+```
+
+Use a custom registry directory with either:
+
+```bash
+./bin/brain --registry /path/to/registry status
+AGENT_BRAIN_HOME=/path/to/registry npm start
+```
+
+## Registry model
+
+The private registry is plain JSON and Markdown:
+
+```text
+~/.agent-brain/
+├── config/brain.json
+├── domains/**/domain.json
+├── projects/*.json
+├── workflows/**/*.json
+├── data/inventory.json       # generated
+├── reports/audit.md          # generated
+├── state/                    # local override
+└── views/                    # generated dashboard/canvas
+```
+
+Starter domains are Work, Personal, Personal Software, Creative, Meta, and
+Meta Agent System. They are examples, not hard-coded product behavior: rename,
+remove, nest, or extend them freely.
+
+Scope and source precedence can be declared without changing Python:
+
+```json
+{
+  "skill_scope_rules": [
+    {
+      "source_pattern": "/company-tools/",
+      "level": "domain",
+      "domain": "work.company"
+    }
+  ],
+  "source_priority_rules": [
+    {
+      "source_pattern": "/canonical-skills/",
+      "priority": 190,
+      "role": "company canonical"
+    }
+  ]
+}
+```
+
+Plugin skills remain inactive by default. Add a plugin ID to
+`config/brain.json` only when it should participate automatically:
+
+```json
+{ "active_plugins": ["my-plugin"] }
+```
+
+## Runtime integration
+
+The registry works without changing agent configuration. For automatic prompt
+context, see [adapters/README.md](adapters/README.md). The adapters are opt-in
+and preserve existing hooks. Agent Brain is a routing control plane: the hook
+adds deterministic context but cannot remove capabilities that a host runtime
+has already exposed globally. Use host-level plugin/skill settings as the hard
+capability boundary.
+
+## Desktop security
+
+The Electron renderer has no Node.js access. It uses context isolation, the
+Chromium sandbox, a narrow preload bridge, sender-validated IPC, denied
+navigation/windows/permissions, a restrictive CSP, hardened Electron fuses,
+bounded Python subprocess output, timeouts, atomic writes, and serialized
+registry mutations.
+
+The packaged application contains only the engine and starter templates. It
+never embeds the developer's private registry, projects, generated inventory,
+or skill contents.
+
+## Development
+
+```bash
+python3 -m unittest discover -s tests -v
+npm test
+./bin/brain validate
+npm run package:universal
+npm run test:package
+npm run make:universal
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the release and privacy gates.
+
+## License
+
+[MIT](LICENSE)

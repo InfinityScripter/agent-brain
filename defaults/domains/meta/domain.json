@@ -1,0 +1,8 @@
+{
+  "id": "meta",
+  "name": "Meta",
+  "description": "Agent infrastructure, memory, skills, configuration, and quality systems.",
+  "color": "#9C83FF",
+  "icon": "orbit",
+  "parent": null
+}

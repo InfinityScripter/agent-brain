@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+RESOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+case "$(uname -m)" in
+  arm64) PYTHON_ARCH=arm64 ;;
+  x86_64) PYTHON_ARCH=x64 ;;
+  *) echo "Unsupported macOS architecture" >&2; exit 1 ;;
+esac
+exec "$RESOURCE_DIR/python-$PYTHON_ARCH/python/bin/python3" -B "$RESOURCE_DIR/brain.py" "$@"

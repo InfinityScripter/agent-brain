@@ -1,0 +1,8 @@
+{
+  "id": "personal.software",
+  "name": "Personal · Software",
+  "description": "Independent software products, experiments, and open-source work.",
+  "color": "#E99B32",
+  "icon": "code",
+  "parent": "personal"
+}

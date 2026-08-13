@@ -1,0 +1,40 @@
+{
+  "schema_version": "agent-brain.config.v1",
+  "owner": "local-user",
+  "default_domain": "meta.agent-system",
+  "skill_roots": [
+    {
+      "path": "~/.agents/skills",
+      "runtime": "shared",
+      "kind": "canonical",
+      "optional": true
+    },
+    {
+      "path": "~/.codex/skills",
+      "runtime": "codex",
+      "kind": "mount",
+      "optional": true
+    },
+    {
+      "path": "~/.claude/skills",
+      "runtime": "claude",
+      "kind": "mount",
+      "optional": true
+    }
+  ],
+  "instruction_files": [],
+  "domain_path_rules": [
+    {
+      "path": "~/Projects",
+      "domain": "personal.software",
+      "dynamic_project": true
+    },
+    {
+      "path": "~/.agent-brain",
+      "domain": "meta.agent-system"
+    }
+  ],
+  "skill_scope_rules": [],
+  "active_plugins": [],
+  "source_priority_rules": []
+}

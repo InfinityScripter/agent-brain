@@ -1,0 +1,1765 @@
+#!/usr/bin/env python3
+"""Agent Brain registry, context router, validator, and view generator.
+
+The program only reads external agent configuration and skill directories. Its
+engine is location-independent; user manifests and generated state live in a
+separate registry directory selected by ``--registry`` or
+``AGENT_BRAIN_HOME``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import http.server
+import json
+import os
+import re
+import shutil
+import socketserver
+import sys
+import tempfile
+import threading
+import webbrowser
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+ENGINE_DIR = Path(__file__).resolve().parent
+DEFAULTS_DIR = ENGINE_DIR / "defaults"
+DEFAULT_REGISTRY_DIR = (
+    ENGINE_DIR
+    if (ENGINE_DIR / "config" / "brain.json").is_file()
+    else Path.home() / ".agent-brain"
+)
+REGISTRY_DIR = Path(
+    os.environ.get("AGENT_BRAIN_HOME", str(DEFAULT_REGISTRY_DIR))
+).expanduser()
+CONFIG_PATH = REGISTRY_DIR / "config" / "brain.json"
+DATA_PATH = REGISTRY_DIR / "data" / "inventory.json"
+STATE_PATH = REGISTRY_DIR / "state" / "active-context.json"
+TEMPLATE_PATH = ENGINE_DIR / "web" / "index.template.html"
+VIEW_PATH = REGISTRY_DIR / "views" / "index.html"
+CANVAS_PATH = REGISTRY_DIR / "views" / "agent-brain.canvas"
+AUDIT_PATH = REGISTRY_DIR / "reports" / "audit.md"
+ADAPTER_MARKER = "agent-brain:routing"
+
+IGNORED_SCAN_DIRS = {
+    ".git",
+    ".idea",
+    ".vscode",
+    "assets",
+    "examples",
+    "node_modules",
+    "references",
+    "scripts",
+    "templates",
+    "tests",
+}
+
+SCOPE_SCORE = {
+    "archive": 0,
+    "global": 10,
+    "plugin": 15,
+    "domain": 20,
+    "project": 30,
+}
+
+
+def configure_paths(registry: Path) -> None:
+    global REGISTRY_DIR, CONFIG_PATH, DATA_PATH, STATE_PATH, VIEW_PATH, CANVAS_PATH, AUDIT_PATH
+    REGISTRY_DIR = safe_resolve(registry.expanduser())
+    CONFIG_PATH = REGISTRY_DIR / "config" / "brain.json"
+    DATA_PATH = REGISTRY_DIR / "data" / "inventory.json"
+    STATE_PATH = REGISTRY_DIR / "state" / "active-context.json"
+    VIEW_PATH = REGISTRY_DIR / "views" / "index.html"
+    CANVAS_PATH = REGISTRY_DIR / "views" / "agent-brain.canvas"
+    AUDIT_PATH = REGISTRY_DIR / "reports" / "audit.md"
+
+
+def scopes_can_be_active_together(
+    first: Dict[str, Optional[str]], second: Dict[str, Optional[str]]
+) -> bool:
+    """Return whether two equal-rank candidates can coexist in one context."""
+
+    if first["level"] == "project" and second["level"] == "project":
+        return first.get("project") == second.get("project")
+    if first["level"] == "domain" and second["level"] == "domain":
+        first_domain = first.get("domain") or ""
+        second_domain = second.get("domain") or ""
+        return (
+            first_domain == second_domain
+            or first_domain.startswith(second_domain + ".")
+            or second_domain.startswith(first_domain + ".")
+        )
+    return True
+
+
+def read_json(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        value = json.load(handle)
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected object in {path}")
+    return value
+
+
+def write_text_atomic(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        text=True,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def write_json(path: Path, value: Any) -> None:
+    write_text_atomic(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def safe_resolve(path: Path) -> Path:
+    try:
+        return path.resolve(strict=False)
+    except OSError:
+        return path.absolute()
+
+
+def is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def slug(value: str) -> str:
+    normalized = re.sub(r"[^\w]+", "-", value.casefold(), flags=re.UNICODE).strip("-_")
+    return normalized or "unnamed"
+
+
+def first_paragraph(value: str, limit: int = 220) -> str:
+    compact = re.sub(r"\s+", " ", value).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1].rstrip() + "…"
+
+
+def parse_skill_metadata(skill_file: Path, fallback_name: str) -> Dict[str, str]:
+    """Read only frontmatter/name/description, never the full skill body."""
+
+    try:
+        with skill_file.open("r", encoding="utf-8", errors="replace") as handle:
+            lines = []
+            for index, line in enumerate(handle):
+                if index >= 100:
+                    break
+                lines.append(line.rstrip("\n"))
+    except OSError:
+        return {"name": fallback_name, "description": ""}
+
+    name = fallback_name
+    description = ""
+    if lines and lines[0].strip() == "---":
+        frontmatter: List[str] = []
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            frontmatter.append(line)
+
+        collecting_description = False
+        description_lines: List[str] = []
+        for line in frontmatter:
+            name_match = re.match(r"^name:\s*[\"']?(.*?)[\"']?\s*$", line)
+            if name_match:
+                name = name_match.group(1).strip() or fallback_name
+                collecting_description = False
+                continue
+            description_match = re.match(r"^description:\s*(.*)$", line)
+            if description_match:
+                raw = description_match.group(1).strip().strip("\"'")
+                if raw not in {"|", ">", "|-", ">-"}:
+                    description_lines.append(raw)
+                collecting_description = True
+                continue
+            if collecting_description:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_-]*:\s*", line):
+                    collecting_description = False
+                elif line.startswith("  "):
+                    description_lines.append(line.strip())
+        description = first_paragraph(" ".join(description_lines))
+
+    return {"name": name, "description": description}
+
+
+def package_fingerprint(package_dir: Path) -> str:
+    """Hash package structure/content without copying it into the inventory."""
+
+    digest = hashlib.sha256()
+    file_count = 0
+    try:
+        for current, dirnames, filenames in os.walk(str(package_dir), followlinks=False):
+            dirnames[:] = sorted(
+                name
+                for name in dirnames
+                if name not in {".git", "node_modules", "__pycache__"}
+            )
+            current_path = Path(current)
+            for filename in sorted(filenames):
+                path = current_path / filename
+                try:
+                    relative = path.relative_to(package_dir)
+                    stat = path.stat()
+                except OSError:
+                    continue
+                digest.update(str(relative).encode("utf-8", errors="replace"))
+                digest.update(str(stat.st_size).encode("ascii"))
+                if stat.st_size <= 2_000_000:
+                    try:
+                        with path.open("rb") as handle:
+                            for chunk in iter(lambda: handle.read(65536), b""):
+                                digest.update(chunk)
+                    except OSError:
+                        continue
+                file_count += 1
+    except OSError:
+        pass
+    digest.update(f"files:{file_count}".encode("ascii"))
+    return digest.hexdigest()
+
+
+def expand_path(value: str) -> Path:
+    return Path(os.path.expandvars(value)).expanduser()
+
+
+def load_domains() -> List[Dict[str, Any]]:
+    domains = [read_json(path) for path in sorted((REGISTRY_DIR / "domains").glob("**/domain.json"))]
+    return sorted(domains, key=lambda item: (item.get("id", "").count("."), item.get("id", "")))
+
+
+def load_projects() -> List[Dict[str, Any]]:
+    projects = [read_json(path) for path in sorted((REGISTRY_DIR / "projects").glob("*.json"))]
+    for project in projects:
+        project["path"] = str(expand_path(project["path"]))
+        project["exists"] = expand_path(project["path"]).is_dir()
+    return sorted(projects, key=lambda item: item["name"].lower())
+
+
+def project_for_workspace_path(
+    cwd: Path, projects: Sequence[Dict[str, Any]]
+) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], int]]:
+    """Resolve an alternate checkout/worktree back to its canonical project."""
+
+    matches: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
+    for project in projects:
+        for rule in project.get("workspace_rules", []):
+            root = safe_resolve(expand_path(rule["root"]))
+            if not is_relative_to(cwd, root):
+                continue
+            relative = cwd.relative_to(root)
+            if rule.get("dynamic_child", False):
+                if not relative.parts:
+                    continue
+                workspace_root = root / relative.parts[0]
+                workspace_id = relative.parts[0]
+            else:
+                workspace_root = root
+                workspace_id = rule.get("id") or root.name
+            project_path = safe_resolve(workspace_root / rule.get("project_path", ""))
+            if not is_relative_to(cwd, project_path):
+                continue
+            workspace = {
+                "id": workspace_id,
+                "name": workspace_id,
+                "path": str(workspace_root),
+                "project_path": str(project_path),
+                "kind": rule.get("kind", "workspace"),
+                "dynamic": bool(rule.get("dynamic_child", False)),
+            }
+            matches.append((len(project_path.parts), project, workspace))
+
+    if not matches:
+        return None
+    score, project, workspace = max(matches, key=lambda item: item[0])
+    return project, workspace, score
+
+
+def load_workflows() -> List[Dict[str, Any]]:
+    workflows = [read_json(path) for path in sorted((REGISTRY_DIR / "workflows").glob("**/*.json"))]
+    return sorted(workflows, key=lambda item: item["id"])
+
+
+def validate_source_manifests(base_dir: Optional[Path] = None) -> Dict[str, List[str]]:
+    base_dir = base_dir or REGISTRY_DIR
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    def load(path: Path) -> Optional[Dict[str, Any]]:
+        try:
+            return read_json(path)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            errors.append(f"{path.relative_to(base_dir)}: invalid JSON object: {error}")
+            return None
+
+    def require_string(item: Dict[str, Any], key: str, path: Path) -> None:
+        if not isinstance(item.get(key), str) or not item[key].strip():
+            errors.append(f"{path.relative_to(base_dir)}: {key} must be a non-empty string")
+
+    config_path = base_dir / "config" / "brain.json"
+    config = load(config_path)
+    if config is not None:
+        require_string(config, "default_domain", config_path)
+        for key in ("skill_roots", "instruction_files", "domain_path_rules"):
+            if not isinstance(config.get(key), list):
+                errors.append(f"{config_path.relative_to(base_dir)}: {key} must be an array")
+        if not isinstance(config.get("active_plugins", []), list) or any(
+            not isinstance(plugin, str) or not plugin.strip() for plugin in config.get("active_plugins", [])
+        ):
+            errors.append("config/brain.json: active_plugins must be an array of strings")
+        for index, root in enumerate(config.get("skill_roots", []) if isinstance(config.get("skill_roots"), list) else []):
+            if not isinstance(root, dict):
+                errors.append(f"config/brain.json: skill_roots[{index}] must be an object")
+                continue
+            for key in ("path", "runtime", "kind"):
+                require_string(root, key, config_path)
+            if "optional" in root and not isinstance(root["optional"], bool):
+                errors.append(f"config/brain.json: skill_roots[{index}].optional must be a boolean")
+        for index, instruction in enumerate(config.get("instruction_files", []) if isinstance(config.get("instruction_files"), list) else []):
+            if not isinstance(instruction, dict):
+                errors.append(f"config/brain.json: instruction_files[{index}] must be an object")
+                continue
+            for key in ("path", "runtime", "scope"):
+                require_string(instruction, key, config_path)
+        for index, rule in enumerate(config.get("domain_path_rules", []) if isinstance(config.get("domain_path_rules"), list) else []):
+            if not isinstance(rule, dict):
+                errors.append(f"config/brain.json: domain_path_rules[{index}] must be an object")
+                continue
+            for key in ("path", "domain"):
+                require_string(rule, key, config_path)
+        for rule_name in ("skill_scope_rules", "source_priority_rules"):
+            rules = config.get(rule_name, [])
+            if not isinstance(rules, list):
+                errors.append(f"config/brain.json: {rule_name} must be an array")
+                continue
+            for index, rule in enumerate(rules):
+                if not isinstance(rule, dict):
+                    errors.append(f"config/brain.json: {rule_name}[{index}] must be an object")
+                    continue
+                if rule_name == "skill_scope_rules":
+                    if not rule.get("names") and not rule.get("source_pattern"):
+                        errors.append(f"config/brain.json: {rule_name}[{index}] needs names or source_pattern")
+                    if "names" in rule and (
+                        not isinstance(rule["names"], list)
+                        or any(not isinstance(name, str) or not name.strip() for name in rule["names"])
+                    ):
+                        errors.append(f"config/brain.json: {rule_name}[{index}].names must be an array of strings")
+                    if rule.get("level") not in {"global", "domain", "plugin", "archive"}:
+                        errors.append(f"config/brain.json: {rule_name}[{index}].level is invalid")
+                    if rule.get("level") == "domain" and not isinstance(rule.get("domain"), str):
+                        errors.append(f"config/brain.json: {rule_name}[{index}].domain is required")
+                    if rule.get("level") == "plugin" and not isinstance(rule.get("plugin"), str):
+                        errors.append(f"config/brain.json: {rule_name}[{index}].plugin is required")
+                else:
+                    if not isinstance(rule.get("priority"), int):
+                        errors.append(f"config/brain.json: {rule_name}[{index}].priority must be an integer")
+                if "source_pattern" in rule:
+                    if not isinstance(rule["source_pattern"], str) or not rule["source_pattern"]:
+                        errors.append(f"config/brain.json: {rule_name}[{index}].source_pattern must be a non-empty string")
+                    else:
+                        try:
+                            re.compile(rule["source_pattern"])
+                        except re.error as error:
+                            errors.append(f"config/brain.json: {rule_name}[{index}].source_pattern is invalid: {error}")
+
+    for path in sorted((base_dir / "domains").glob("**/domain.json")):
+        item = load(path)
+        if item is None:
+            continue
+        for key in ("id", "name", "description"):
+            require_string(item, key, path)
+        if item.get("parent") is not None and not isinstance(item.get("parent"), str):
+            errors.append(f"{path.relative_to(base_dir)}: parent must be a string or null")
+
+    for path in sorted((base_dir / "projects").glob("*.json")):
+        item = load(path)
+        if item is None:
+            continue
+        for key in ("id", "name", "path", "domain"):
+            require_string(item, key, path)
+        for key in ("aliases", "instruction_files", "skill_roots", "related_projects", "workspace_rules"):
+            if key in item and not isinstance(item[key], list):
+                errors.append(f"{path.relative_to(base_dir)}: {key} must be an array")
+        for key in ("aliases", "instruction_files", "skill_roots"):
+            if isinstance(item.get(key, []), list):
+                for index, value in enumerate(item.get(key, [])):
+                    if not isinstance(value, str) or not value.strip():
+                        errors.append(f"{path.relative_to(base_dir)}: {key}[{index}] must be a non-empty string")
+        for index, relation in enumerate(item.get("related_projects", []) if isinstance(item.get("related_projects"), list) else []):
+            if not isinstance(relation, dict):
+                errors.append(f"{path.relative_to(base_dir)}: related_projects[{index}] must be an object")
+                continue
+            for key in ("project", "type"):
+                if not isinstance(relation.get(key), str) or not relation[key].strip():
+                    errors.append(f"{path.relative_to(base_dir)}: related_projects[{index}].{key} must be a non-empty string")
+        for index, rule in enumerate(item.get("workspace_rules", []) if isinstance(item.get("workspace_rules"), list) else []):
+            if not isinstance(rule, dict):
+                errors.append(f"{path.relative_to(base_dir)}: workspace_rules[{index}] must be an object")
+                continue
+            require_string(rule, "root", path)
+            if "project_path" in rule and not isinstance(rule["project_path"], str):
+                errors.append(f"{path.relative_to(base_dir)}: workspace_rules[{index}].project_path must be a string")
+            if "dynamic_child" in rule and not isinstance(rule["dynamic_child"], bool):
+                errors.append(f"{path.relative_to(base_dir)}: workspace_rules[{index}].dynamic_child must be a boolean")
+
+    for path in sorted((base_dir / "workflows").glob("**/*.json")):
+        item = load(path)
+        if item is None:
+            continue
+        for key in ("id", "name", "domain"):
+            require_string(item, key, path)
+        if item.get("project") is not None and not isinstance(item.get("project"), str):
+            errors.append(f"{path.relative_to(base_dir)}: project must be a string or null")
+        steps = item.get("steps")
+        if not isinstance(steps, list) or any(not isinstance(step, str) or not step for step in steps):
+            errors.append(f"{path.relative_to(base_dir)}: steps must be an array of non-empty strings")
+
+    return {"errors": errors, "warnings": warnings}
+
+
+def walk_skill_files(root: Path, max_depth: int = 5) -> Iterable[Tuple[Path, Path]]:
+    """Yield ``(mount_dir, SKILL.md)`` while preserving top-level symlinks."""
+
+    if not root.is_dir():
+        return
+
+    for child in sorted(root.iterdir(), key=lambda item: item.name.lower()):
+        if child.name.startswith(".") and child.name != ".system":
+            continue
+
+        if child.is_symlink():
+            resolved = safe_resolve(child)
+            skill_file = resolved / "SKILL.md"
+            if skill_file.is_file():
+                yield child, skill_file
+            continue
+
+        if not child.is_dir():
+            continue
+
+        direct = child / "SKILL.md"
+        if direct.is_file():
+            yield child, direct
+            continue
+
+        child_parts = len(child.parts)
+        for current, dirnames, filenames in os.walk(str(child), followlinks=False):
+            current_path = Path(current)
+            depth = len(current_path.parts) - child_parts
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if name not in IGNORED_SCAN_DIRS and not name.startswith(".")
+            ]
+            if depth >= max_depth:
+                dirnames[:] = []
+            if "SKILL.md" in filenames:
+                yield current_path, current_path / "SKILL.md"
+                dirnames[:] = []
+
+
+def plugin_identity(source: Path) -> Optional[str]:
+    parts = source.parts
+    try:
+        cache_index = parts.index("cache")
+    except ValueError:
+        return None
+    if ".codex" not in parts[:cache_index]:
+        return None
+    tail = parts[cache_index + 1 :]
+    if not tail:
+        return "unknown"
+    if len(tail) >= 2 and re.fullmatch(r"\d+(?:\.\d+)*(?:-[\w.-]+)?", tail[1]):
+        return tail[0]
+    if len(tail) >= 2:
+        return f"{tail[0]}.{tail[1]}"
+    return tail[0]
+
+
+def find_project_for_path(source: Path, projects: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    matches = []
+    for project in projects:
+        project_path = safe_resolve(expand_path(project["path"]))
+        if is_relative_to(source, project_path):
+            matches.append((len(project_path.parts), project))
+    return max(matches, default=(0, None), key=lambda item: item[0])[1]
+
+
+def classify_scope(
+    name: str,
+    source: Path,
+    config: Dict[str, Any],
+    projects: Sequence[Dict[str, Any]],
+) -> Dict[str, Optional[str]]:
+    source_text = str(source)
+    if "skill-snapshots" in source_text or "-workspace/skill-snapshot" in source_text:
+        return {"level": "archive", "domain": None, "project": None, "plugin": None}
+
+    project = find_project_for_path(source, projects)
+    if project:
+        return {
+            "level": "project",
+            "domain": project["domain"],
+            "project": project["id"],
+            "plugin": None,
+        }
+
+    for rule in config.get("skill_scope_rules", []):
+        names = rule.get("names", [])
+        source_pattern = rule.get("source_pattern")
+        if (names and name in names) or (source_pattern and re.search(source_pattern, source_text)):
+            return {
+                "level": rule["level"],
+                "domain": rule.get("domain"),
+                "project": None,
+                "plugin": rule.get("plugin"),
+            }
+
+    plugin = plugin_identity(source)
+    if plugin:
+        return {"level": "plugin", "domain": None, "project": None, "plugin": plugin}
+
+    return {"level": "global", "domain": None, "project": None, "plugin": None}
+
+
+def skill_id(name: str, scope: Dict[str, Optional[str]]) -> str:
+    suffix = slug(name)
+    level = scope["level"]
+    if level == "project":
+        return f"project.{slug(scope.get('project') or 'unknown')}.{suffix}"
+    if level == "domain":
+        return f"domain.{scope.get('domain') or 'unknown'}.{suffix}"
+    if level == "plugin":
+        return f"plugin.{slug(scope.get('plugin') or 'unknown')}.{suffix}"
+    if level == "archive":
+        digest = hashlib.sha1(str(scope).encode("utf-8")).hexdigest()[:7]
+        return f"archive.{suffix}.{digest}"
+    return f"global.{suffix}"
+
+
+def source_priority(
+    name: str,
+    source_path: str,
+    scope: Dict[str, Optional[str]],
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, str]:
+    if scope["level"] == "archive":
+        return 0, "archive"
+    if scope["level"] == "project":
+        return 200, "project canonical"
+    for rule in (config or {}).get("source_priority_rules", []):
+        if rule.get("name_prefix") and not name.startswith(rule["name_prefix"]):
+            continue
+        if rule.get("source_pattern") and not re.search(rule["source_pattern"], source_path):
+            continue
+        return rule["priority"], rule.get("role", "configured source")
+    if "/.codex/plugins/cache/" in source_path:
+        return 170, "plugin package"
+    if "/.agents/skills/" in source_path:
+        return 160, "shared canonical"
+    if "/.codex/skills/" in source_path:
+        return 140, "Codex runtime copy"
+    if "/.claude/skills/" in source_path:
+        return 130, "Claude runtime copy"
+    return 100, "registered source"
+
+
+def collect_skill_occurrences(
+    config: Dict[str, Any], projects: Sequence[Dict[str, Any]]
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    roots = list(config.get("skill_roots", []))
+    known_root_paths = {str(safe_resolve(expand_path(item["path"]))) for item in roots}
+    for project in projects:
+        for relative in project.get("skill_roots", []):
+            path = safe_resolve(expand_path(project["path"]) / relative)
+            if str(path) in known_root_paths or not path.is_dir():
+                continue
+            roots.append(
+                {
+                    "path": str(path),
+                    "runtime": "project",
+                    "kind": "canonical",
+                    "project": project["id"],
+                    "domain": project["domain"],
+                }
+            )
+            known_root_paths.add(str(path))
+
+    occurrences: List[Dict[str, Any]] = []
+    broken: List[Dict[str, Any]] = []
+    seen_mount_runtime: set = set()
+
+    for root_spec in roots:
+        root = expand_path(root_spec["path"])
+        if not root.exists():
+            if not root_spec.get("optional", False):
+                broken.append({"kind": "missing_skill_root", "path": str(root)})
+            continue
+        for mount_dir, skill_file in walk_skill_files(root):
+            mount_key = (str(mount_dir), root_spec["runtime"])
+            if mount_key in seen_mount_runtime:
+                continue
+            seen_mount_runtime.add(mount_key)
+            source_dir = safe_resolve(skill_file.parent)
+            metadata = parse_skill_metadata(skill_file, mount_dir.name)
+            scope = (
+                {
+                    "level": "project",
+                    "domain": root_spec["domain"],
+                    "project": root_spec["project"],
+                    "plugin": None,
+                }
+                if root_spec.get("project")
+                else classify_scope(metadata["name"], source_dir, config, projects)
+            )
+            occurrences.append(
+                {
+                    "logical_name": metadata["name"],
+                    "mount_name": mount_dir.name,
+                    "description": metadata["description"],
+                    "mount_path": str(mount_dir),
+                    "source_path": str(source_dir),
+                    "package_fingerprint": package_fingerprint(source_dir),
+                    "scope": scope,
+                    "skill_file": str(skill_file),
+                    "runtime": root_spec["runtime"],
+                    "root_kind": root_spec["kind"],
+                    "is_symlink": mount_dir.is_symlink(),
+                }
+            )
+
+    return occurrences, broken
+
+
+def merge_skills(
+    occurrences: Sequence[Dict[str, Any]],
+    config: Dict[str, Any],
+    projects: Sequence[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    by_source: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for occurrence in occurrences:
+        scope_key = json.dumps(occurrence["scope"], ensure_ascii=True, sort_keys=True)
+        by_source[(occurrence["package_fingerprint"], scope_key)].append(occurrence)
+
+    skills: List[Dict[str, Any]] = []
+    used_ids: Dict[str, int] = defaultdict(int)
+    for (fingerprint, _scope_key), mounts in sorted(by_source.items()):
+        preferred = sorted(
+            mounts,
+            key=lambda item: (
+                item["root_kind"] != "canonical",
+                item["runtime"] == "project",
+                item["mount_path"],
+            ),
+        )[0]
+        name = preferred["logical_name"] or preferred["mount_name"]
+        scope = preferred["scope"]
+        source_path = preferred["source_path"]
+        priority, source_role = source_priority(name, source_path, scope, config)
+        identifier = skill_id(name, scope)
+        used_ids[identifier] += 1
+        if used_ids[identifier] > 1:
+            identifier = f"{identifier}.{hashlib.sha1(source_path.encode('utf-8')).hexdigest()[:7]}"
+
+        runtimes = sorted({item["runtime"] for item in mounts})
+        mount_paths = sorted({item["mount_path"] for item in mounts})
+        skills.append(
+            {
+                "id": identifier,
+                "name": name,
+                "mount_names": sorted({item["mount_name"] for item in mounts}),
+                "description": preferred["description"],
+                "scope": scope,
+                "source_path": source_path,
+                "alternate_sources": sorted({item["source_path"] for item in mounts if item["source_path"] != source_path}),
+                "package_fingerprint": fingerprint,
+                "source_priority": priority,
+                "source_role": source_role,
+                "mounts": mount_paths,
+                "runtimes": runtimes,
+                "mount_count": len(mount_paths),
+                "symlink_mounts": sum(1 for item in mounts if item["is_symlink"]),
+                "status": "archived" if scope["level"] == "archive" else "available",
+            }
+        )
+
+    collisions: List[Dict[str, Any]] = []
+    by_name: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for skill in skills:
+        if skill["scope"]["level"] != "archive":
+            by_name[skill["name"].casefold()].append(skill)
+
+    for normalized, candidates in sorted(by_name.items()):
+        if len(candidates) < 2:
+            continue
+        candidates = sorted(
+            candidates,
+            key=lambda item: (
+                SCOPE_SCORE[item["scope"]["level"]],
+                item.get("source_priority", 0),
+                item["id"],
+            ),
+            reverse=True,
+        )
+        scope_levels = {item["scope"]["level"] for item in candidates}
+        top_rank = (
+            SCOPE_SCORE[candidates[0]["scope"]["level"]],
+            candidates[0].get("source_priority", 0),
+        )
+        tied_top = [
+            item
+            for item in candidates
+            if (
+                SCOPE_SCORE[item["scope"]["level"]],
+                item.get("source_priority", 0),
+            ) == top_rank
+        ]
+        ambiguous_together = any(
+            scopes_can_be_active_together(first["scope"], second["scope"])
+            for index, first in enumerate(tied_top)
+            for second in tied_top[index + 1 :]
+        )
+        collisions.append(
+            {
+                "name": candidates[0]["name"],
+                "normalized_name": normalized,
+                "severity": "high" if len(scope_levels) > 1 else "medium",
+                "candidate_ids": [item["id"] for item in candidates],
+                "source_paths": [item["source_path"] for item in candidates],
+                "preferred_id": candidates[0]["id"],
+                "status": "unresolved" if len(tied_top) > 1 and ambiguous_together else "resolved",
+                "resolution": (
+                    "mutually exclusive project scopes are resolved by active context"
+                    if len(tied_top) > 1 and not ambiguous_together
+                    else "project > domain > global > canonical source priority; unresolved ties require an explicit namespaced ID"
+                ),
+            }
+        )
+
+    return sorted(skills, key=lambda item: item["id"]), collisions
+
+
+def instruction_inventory(
+    config: Dict[str, Any], projects: Sequence[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    specs = list(config.get("instruction_files", []))
+    for project in projects:
+        for relative in project.get("instruction_files", []):
+            candidate = expand_path(project["path"]) / relative
+            specs.append(
+                {
+                    "path": str(candidate),
+                    "runtime": "claude" if candidate.name == "CLAUDE.md" else "codex",
+                    "scope": "project",
+                    "project": project["id"],
+                    "declared": True,
+                }
+            )
+
+    inventory = []
+    seen = set()
+    for spec in specs:
+        path = expand_path(spec["path"])
+        if str(path) in seen:
+            continue
+        seen.add(str(path))
+        item: Dict[str, Any] = dict(spec)
+        item["exists"] = path.is_file()
+        if path.is_file():
+            raw = path.read_bytes()
+            text = raw.decode("utf-8", errors="replace")
+            item.update(
+                {
+                    "bytes": len(raw),
+                    "lines": text.count("\n") + (0 if text.endswith("\n") else 1),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "headings": re.findall(r"^#{1,3}\s+(.+)$", text, flags=re.MULTILINE)[:40],
+                    "has_user_rules": "user:start" in text,
+                    "has_agent_brain": ADAPTER_MARKER in text,
+                }
+            )
+        inventory.append(item)
+    return sorted(inventory, key=lambda item: item["path"])
+
+
+def build_inventory() -> Dict[str, Any]:
+    config = read_json(CONFIG_PATH)
+    domains = load_domains()
+    projects = load_projects()
+    workflows = load_workflows()
+    occurrences, broken = collect_skill_occurrences(config, projects)
+    skills, collisions = merge_skills(occurrences, config, projects)
+    instructions = instruction_inventory(config, projects)
+
+    for project in projects:
+        project_id = project["id"]
+        project_instructions = [item for item in instructions if item.get("project") == project_id]
+        project_skills = [item for item in skills if item["scope"].get("project") == project_id]
+        project_workflows = [item for item in workflows if item.get("project") == project_id]
+        project["coverage"] = {
+            "instruction_count": sum(1 for item in project_instructions if item.get("exists")),
+            "missing_instruction_count": sum(1 for item in project_instructions if not item.get("exists")),
+            "skill_count": len(project_skills),
+            "workflow_count": len(project_workflows),
+            "related_project_count": len(project.get("related_projects", [])),
+            "workspace_rule_count": len(project.get("workspace_rules", [])),
+        }
+
+    scope_counts: Dict[str, int] = defaultdict(int)
+    runtime_counts: Dict[str, int] = defaultdict(int)
+    for skill in skills:
+        scope_counts[skill["scope"]["level"]] += 1
+        for runtime in skill["runtimes"]:
+            runtime_counts[runtime] += 1
+
+    return {
+        "schema_version": "agent-brain.registry.v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "home": str(Path.home()),
+        "registry": str(REGISTRY_DIR),
+        "config": {
+            "default_domain": config.get("default_domain", "meta.agent-system"),
+            "domain_path_rules": config.get("domain_path_rules", []),
+            "skill_scope_rules": config.get("skill_scope_rules", []),
+            "active_plugins": config.get("active_plugins", []),
+        },
+        "source_snapshot": source_snapshot(config, projects),
+        "domains": domains,
+        "projects": projects,
+        "workflows": workflows,
+        "skills": skills,
+        "collisions": collisions,
+        "broken_sources": broken,
+        "instructions": instructions,
+        "stats": {
+            "skill_sources": len(skills),
+            "skill_mounts": len(occurrences),
+            "scope_counts": dict(sorted(scope_counts.items())),
+            "runtime_counts": dict(sorted(runtime_counts.items())),
+            "collision_count": len(collisions),
+            "unresolved_collision_count": sum(1 for item in collisions if item["status"] == "unresolved"),
+            "broken_count": len(broken),
+            "project_count": len(projects),
+            "domain_count": len(domains),
+            "workflow_count": len(workflows),
+        },
+    }
+
+
+def inventory_config(inventory: Dict[str, Any]) -> Dict[str, Any]:
+    config = inventory.get("config")
+    if isinstance(config, dict):
+        return config
+    return read_json(CONFIG_PATH)
+
+
+def domain_matches(skill_domain: Optional[str], active_domain: str) -> bool:
+    if not skill_domain:
+        return False
+    return active_domain == skill_domain or active_domain.startswith(skill_domain + ".")
+
+
+def read_active_override() -> Optional[str]:
+    if not STATE_PATH.is_file():
+        return None
+    try:
+        value = read_json(STATE_PATH).get("domain")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def resolve_context(
+    cwd: Path,
+    inventory: Dict[str, Any],
+    config: Optional[Dict[str, Any]] = None,
+    explicit_domain: Optional[str] = None,
+) -> Dict[str, Any]:
+    config = config or inventory_config(inventory)
+    resolved_cwd = safe_resolve(cwd)
+    project_matches: List[Tuple[int, Dict[str, Any]]] = []
+    for project in inventory["projects"]:
+        project_path = safe_resolve(expand_path(project["path"]))
+        if is_relative_to(resolved_cwd, project_path):
+            project_matches.append((len(project_path.parts), project))
+
+    direct_score, project = max(project_matches, default=(0, None), key=lambda item: item[0])
+    workspace = None
+    workspace_match = project_for_workspace_path(resolved_cwd, inventory["projects"])
+    if workspace_match:
+        workspace_project, matched_workspace, workspace_score = workspace_match
+        if workspace_score > direct_score:
+            project = workspace_project
+            workspace = matched_workspace
+    domain = project["domain"] if project else None
+    source = "workspace" if workspace else "project" if project else None
+
+    if not domain:
+        path_matches = []
+        for rule in config.get("domain_path_rules", []):
+            rule_path = safe_resolve(expand_path(rule["path"]))
+            if is_relative_to(resolved_cwd, rule_path):
+                path_matches.append((len(rule_path.parts), rule))
+        if path_matches:
+            _, matched_rule = max(path_matches, key=lambda item: item[0])
+            domain = matched_rule["domain"]
+            source = "path"
+            if matched_rule.get("dynamic_project"):
+                relative = resolved_cwd.relative_to(safe_resolve(expand_path(matched_rule["path"])))
+                if relative.parts:
+                    workspace = {
+                        "id": relative.parts[0],
+                        "name": relative.parts[0],
+                        "path": str(safe_resolve(expand_path(matched_rule["path"])) / relative.parts[0]),
+                        "kind": "worktree",
+                        "dynamic": True,
+                    }
+
+    override = explicit_domain or read_active_override()
+    if explicit_domain:
+        project = None
+        workspace = None
+        domain = explicit_domain
+        source = "explicit"
+    elif not project and not domain and override:
+        domain = override
+        source = "override"
+    elif not domain:
+        domain = config.get("default_domain", "meta.agent-system")
+        source = "default"
+
+    chain = []
+    parts = domain.split(".")
+    for index in range(1, len(parts) + 1):
+        chain.append(".".join(parts[:index]))
+    if project:
+        chain.append(f"project:{project['id']}")
+    if workspace:
+        chain.append(f"workspace:{workspace['id']}")
+
+    return {
+        "cwd": str(resolved_cwd),
+        "domain": domain,
+        "project": project,
+        "workspace": workspace,
+        "source": source,
+        "chain": chain,
+        "active_plugins": config.get("active_plugins", []),
+    }
+
+
+def skill_is_active(skill: Dict[str, Any], context: Dict[str, Any]) -> bool:
+    scope = skill["scope"]
+    level = scope["level"]
+    if level == "global":
+        return True
+    if level == "plugin":
+        return scope.get("plugin") in context.get("active_plugins", [])
+    if level == "domain":
+        return domain_matches(scope.get("domain"), context["domain"])
+    if level == "project":
+        return bool(context.get("project") and scope.get("project") == context["project"]["id"])
+    return False
+
+
+def context_status(cwd: Path, inventory: Dict[str, Any], explicit_domain: Optional[str] = None) -> Dict[str, Any]:
+    context = resolve_context(cwd, inventory, explicit_domain=explicit_domain)
+    active = [skill for skill in inventory["skills"] if skill_is_active(skill, context)]
+    excluded = [skill for skill in inventory["skills"] if not skill_is_active(skill, context)]
+    collision_names = {
+        item["normalized_name"]
+        for item in inventory["collisions"]
+        if item.get("status") == "unresolved"
+    }
+    active_collisions = sorted(
+        {
+            skill["name"]
+            for skill in active
+            if skill["name"].casefold() in collision_names
+        }
+    )
+    active_workflows = [
+        workflow["id"]
+        for workflow in inventory.get("workflows", [])
+        if domain_matches(workflow.get("domain"), context["domain"])
+        and (not workflow.get("project") or (context.get("project") and workflow["project"] == context["project"]["id"]))
+    ]
+    return {
+        "context": context,
+        "active_skill_count": len(active),
+        "excluded_skill_count": len(excluded),
+        "active_skills": [item["id"] for item in active],
+        "active_collisions": active_collisions,
+        "active_workflows": active_workflows,
+        "registry_generated_at": inventory["generated_at"],
+    }
+
+
+def select_skill(query: str, status: Dict[str, Any], inventory: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = query.casefold()
+    exact_candidates = [
+        skill
+        for skill in inventory["skills"]
+        if normalized == skill["id"].casefold()
+        or normalized == skill["name"].casefold()
+    ]
+    candidates = exact_candidates or [
+        skill
+        for skill in inventory["skills"]
+        if normalized in skill["id"].casefold() or normalized in skill["name"].casefold()
+    ]
+    if not candidates:
+        return {"query": query, "selected": None, "candidates": [], "reason": "no matching skill"}
+
+    active_ids = set(status["active_skills"])
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            item["id"] in active_ids,
+            SCOPE_SCORE[item["scope"]["level"]],
+            item.get("source_priority", 0),
+            item["mount_count"],
+            item["id"],
+        ),
+        reverse=True,
+    )
+    exact_id = next((item for item in candidates if normalized == item["id"].casefold()), None)
+    selected = ranked[0] if ranked[0]["id"] in active_ids else None
+    if exact_id and exact_id["scope"]["level"] != "archive":
+        selected = exact_id
+    elif selected:
+        selected_score = SCOPE_SCORE[selected["scope"]["level"]]
+        selected_priority = selected.get("source_priority", 0)
+        equally_specific = [
+            item
+            for item in ranked
+            if item["id"] in active_ids
+            and SCOPE_SCORE[item["scope"]["level"]] == selected_score
+            and item.get("source_priority", 0) == selected_priority
+        ]
+        if len(equally_specific) > 1:
+            selected = None
+    if selected:
+        level = selected["scope"]["level"]
+        reason = f"active {level} scope and canonical source priority"
+        if normalized == selected["id"].casefold():
+            reason = "explicit namespaced ID"
+    elif exact_id and exact_id["scope"]["level"] == "archive":
+        reason = "archived packages cannot be selected"
+    elif any(item["id"] in active_ids for item in ranked):
+        reason = "multiple equally specific active packages; use an explicit namespaced ID"
+    else:
+        reason = "matching skills exist, but all are outside the active context"
+    return {
+        "query": query,
+        "selected": selected,
+        "candidates": ranked,
+        "reason": reason,
+    }
+
+
+def generate_audit(inventory: Dict[str, Any]) -> str:
+    stats = inventory["stats"]
+    instruction_without_adapter = [
+        item["path"] for item in inventory["instructions"] if item.get("scope") == "global" and not item.get("has_agent_brain")
+    ]
+    lines = [
+        "# Agent Brain audit",
+        "",
+        f"Generated: `{inventory['generated_at']}`",
+        "",
+        "## Executive verdict",
+        "",
+        "The runtime is usable, but capability ownership was previously implicit. "
+        "Agent Brain now provides a deterministic scope registry; remaining same-name "
+        "packages are reported rather than silently collapsed.",
+        "",
+        "## Inventory",
+        "",
+        f"- Canonical skill sources: **{stats['skill_sources']}**",
+        f"- Runtime/project mounts: **{stats['skill_mounts']}**",
+        f"- Domains: **{stats['domain_count']}**",
+        f"- Projects: **{stats['project_count']}**",
+        f"- Workflows: **{stats['workflow_count']}**",
+        f"- Same-name source collisions: **{stats['collision_count']}**",
+        f"- Unresolved same-name collisions: **{stats['unresolved_collision_count']}**",
+        f"- Broken configured sources: **{stats['broken_count']}**",
+        "",
+        "## Severity-ranked findings",
+        "",
+    ]
+    if inventory["collisions"]:
+        lines.extend(
+            [
+                "### High — same display name can point to different skill packages",
+                "",
+                "The router resolves these by explicit namespaced ID and scope. They are "
+                "kept visible because deleting one automatically could remove legitimate "
+                "project specialization.",
+                "",
+            ]
+        )
+        for collision in inventory["collisions"]:
+            ids = ", ".join(f"`{item}`" for item in collision["candidate_ids"])
+            lines.append(f"- **{collision['name']}** ({collision['status']} → `{collision['preferred_id']}`): {ids}")
+        lines.append("")
+    else:
+        lines.extend(["- No same-name source collisions.", ""])
+
+    if instruction_without_adapter:
+        lines.extend(
+            [
+                "### Medium — runtime instructions are not all connected to Agent Brain",
+                "",
+            ]
+        )
+        for path in instruction_without_adapter:
+            lines.append(f"- `{path}`")
+        lines.append("")
+    else:
+        lines.extend(
+            [
+                "### Resolved — runtime instructions contain the Agent Brain routing contract",
+                "",
+            ]
+        )
+
+    if inventory["broken_sources"]:
+        lines.extend(["### High — configured sources are missing", ""])
+        for item in inventory["broken_sources"]:
+            lines.append(f"- `{item['path']}` ({item['kind']})")
+        lines.append("")
+
+    lines.extend(
+        [
+            "## Architecture diagnosis",
+            "",
+            "- System prompt: global identity and safety remain owned by the host runtime; "
+            "  Agent Brain adds a narrow routing contract instead of copying that content.",
+            "- Tool selection: mounted capability and active capability are now separate "
+            "  concepts. The registry scope controls automatic selection.",
+            "- Persistence: generated views are derived artifacts. JSON manifests and real "
+            "  skill source paths are authoritative.",
+            "- Rendering: the HTML dashboard and Obsidian Canvas are generated from the same "
+            "  inventory used by `brain status` and `brain explain`.",
+            "",
+            "## Ordered operating procedure",
+            "",
+            "1. Run `bin/brain build` after installing, moving, or removing skills.",
+            "2. Run `bin/brain status` when context selection is unclear.",
+            "3. Run `bin/brain explain <skill>` before using a same-name candidate.",
+            "4. Treat `bin/brain validate` failure as a routing/configuration defect.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def canvas_text(title: str, subtitle: str, color: str) -> str:
+    return f"# {title}\n\n{subtitle}\n\n`{color}`"
+
+
+def generate_canvas(inventory: Dict[str, Any]) -> Dict[str, Any]:
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    node_ids = set()
+
+    def add_node(identifier: str, x: int, y: int, width: int, height: int, text: str, color: str) -> None:
+        if identifier in node_ids:
+            return
+        node_ids.add(identifier)
+        nodes.append(
+            {
+                "id": identifier,
+                "type": "text",
+                "x": x,
+                "y": y,
+                "width": width,
+                "height": height,
+                "text": text,
+                "color": color,
+            }
+        )
+
+    def add_edge(source: str, target: str, label: str) -> None:
+        edges.append(
+            {
+                "id": f"edge-{len(edges) + 1}",
+                "fromNode": source,
+                "fromSide": "right",
+                "toNode": target,
+                "toSide": "left",
+                "label": label,
+            }
+        )
+
+    add_node("core", 0, 0, 320, 170, "# Global Core\n\nSafety · User invariants · Precedence", "6")
+    domain_positions: Dict[str, Tuple[int, int]] = {}
+    top_level = [item for item in inventory["domains"] if not item.get("parent")]
+    top_offsets = {item["id"]: index * 390 - (len(top_level) - 1) * 195 for index, item in enumerate(top_level)}
+    for domain in inventory["domains"]:
+        depth = domain["id"].count(".")
+        root = domain["id"].split(".")[0]
+        x = 460 + depth * 390
+        y = top_offsets.get(root, 0)
+        if depth:
+            siblings = [item for item in inventory["domains"] if item.get("parent") == domain.get("parent")]
+            y += siblings.index(domain) * 190
+        domain_positions[domain["id"]] = (x, y)
+        node_id = f"domain-{slug(domain['id'])}"
+        add_node(
+            node_id,
+            x,
+            y,
+            320,
+            150,
+            f"# {domain['name']}\n\n{domain['description']}",
+            "4" if root == "work" else "3" if root == "personal" else "5" if root == "creative" else "6",
+        )
+        parent_id = f"domain-{slug(domain['parent'])}" if domain.get("parent") else "core"
+        add_edge(parent_id, node_id, "inherits")
+
+    project_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for project in inventory["projects"]:
+        project_groups[project["domain"]].append(project)
+    for domain_id, projects in project_groups.items():
+        base_x, base_y = domain_positions.get(domain_id, (850, 0))
+        for index, project in enumerate(projects):
+            node_id = f"project-{slug(project['id'])}"
+            x = base_x + 410
+            y = base_y + index * 170
+            project_skills = [
+                skill for skill in inventory["skills"] if skill["scope"].get("project") == project["id"]
+            ]
+            add_node(
+                node_id,
+                x,
+                y,
+                340,
+                140,
+                f"# {project['name']}\n\n{len(project_skills)} project skills\n{project['path']}",
+                "2",
+            )
+            add_edge(f"domain-{slug(domain_id)}", node_id, "owns")
+
+    if inventory["collisions"]:
+        add_node(
+            "collisions",
+            0,
+            520,
+            360,
+            170,
+            f"# Conflict radar\n\n{len(inventory['collisions'])} same-name source collisions\nOpen views/index.html for details.",
+            "1",
+        )
+        add_edge("core", "collisions", "diagnoses")
+
+    workflow_y = 760
+    for index, workflow in enumerate(inventory.get("workflows", [])):
+        node_id = f"workflow-{slug(workflow['id'])}"
+        add_node(
+            node_id,
+            0,
+            workflow_y + index * 190,
+            370,
+            160,
+            f"# {workflow['name']}\n\n{workflow['description']}\n\n" + " → ".join(workflow.get("steps", [])),
+            "5",
+        )
+        source_id = f"project-{slug(workflow['project'])}" if workflow.get("project") else f"domain-{slug(workflow['domain'])}"
+        if source_id in node_ids:
+            add_edge(source_id, node_id, "orchestrates")
+
+    return {"nodes": nodes, "edges": edges}
+
+
+def build_outputs() -> Dict[str, Any]:
+    inventory = build_inventory()
+    write_json(DATA_PATH, inventory)
+    write_text_atomic(AUDIT_PATH, generate_audit(inventory))
+    write_json(CANVAS_PATH, generate_canvas(inventory))
+
+    if not TEMPLATE_PATH.is_file():
+        raise FileNotFoundError(f"Missing dashboard template: {TEMPLATE_PATH}")
+    template = TEMPLATE_PATH.read_text(encoding="utf-8")
+    embedded = json.dumps(inventory, ensure_ascii=False).replace("</", "<\\/")
+    rendered = template.replace("__AGENT_BRAIN_DATA__", embedded)
+    write_text_atomic(VIEW_PATH, rendered)
+    return inventory
+
+
+def source_snapshot(
+    config: Optional[Dict[str, Any]] = None,
+    projects: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, int]:
+    snapshot: Dict[str, int] = {}
+    for path in [CONFIG_PATH, *REGISTRY_DIR.glob("domains/**/domain.json"), *REGISTRY_DIR.glob("projects/*.json"), *REGISTRY_DIR.glob("workflows/**/*.json")]:
+        try:
+            snapshot[str(path)] = path.stat().st_mtime_ns
+        except OSError:
+            continue
+    if config is None:
+        config = read_json(CONFIG_PATH) if CONFIG_PATH.is_file() else {}
+    if projects is None:
+        projects = load_projects() if CONFIG_PATH.is_file() else []
+    roots = [expand_path(item["path"]) for item in config.get("skill_roots", []) if isinstance(item, dict) and isinstance(item.get("path"), str)]
+    for project in projects:
+        roots.extend(expand_path(project["path"]) / item for item in project.get("skill_roots", []))
+    for root in roots:
+        try:
+            snapshot[str(root)] = root.stat().st_mtime_ns
+        except OSError:
+            continue
+        for mount_dir, skill_file in walk_skill_files(root):
+            for candidate in (mount_dir, skill_file, safe_resolve(skill_file)):
+                try:
+                    snapshot[str(candidate)] = candidate.stat().st_mtime_ns
+                except OSError:
+                    continue
+    return snapshot
+
+
+def load_or_build_inventory() -> Dict[str, Any]:
+    if DATA_PATH.is_file():
+        try:
+            inventory = read_json(DATA_PATH)
+            if inventory.get("source_snapshot") == source_snapshot():
+                return inventory
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    return build_outputs()
+
+
+def validation_report(inventory: Dict[str, Any]) -> Dict[str, List[str]]:
+    errors: List[str] = []
+    warnings: List[str] = []
+    ids = [item["id"] for item in inventory["skills"]]
+    if len(ids) != len(set(ids)):
+        errors.append("skill IDs are not unique")
+    domain_id_list = [item["id"] for item in inventory["domains"]]
+    project_id_list = [item["id"] for item in inventory["projects"]]
+    workflow_id_list = [item["id"] for item in inventory.get("workflows", [])]
+    if len(domain_id_list) != len(set(domain_id_list)):
+        errors.append("domain IDs are not unique")
+    if len(project_id_list) != len(set(project_id_list)):
+        errors.append("project IDs are not unique")
+    if len(workflow_id_list) != len(set(workflow_id_list)):
+        errors.append("workflow IDs are not unique")
+    domain_ids = set(domain_id_list)
+    project_ids = set(project_id_list)
+    skill_ids = {item["id"] for item in inventory["skills"]}
+    project_domains = {item["id"]: item["domain"] for item in inventory["projects"]}
+    config = inventory_config(inventory)
+    if config.get("default_domain") not in domain_ids:
+        errors.append(f"config default_domain references unknown domain {config.get('default_domain')}")
+    for rule in config.get("domain_path_rules", []):
+        if rule.get("domain") not in domain_ids:
+            errors.append(f"config path rule references unknown domain {rule.get('domain')}")
+    for rule in config.get("skill_scope_rules", []):
+        if rule.get("level") == "domain" and rule.get("domain") not in domain_ids:
+            errors.append(f"config skill scope rule references unknown domain {rule.get('domain')}")
+    for domain in inventory["domains"]:
+        if domain.get("parent") and domain["parent"] not in domain_ids:
+            errors.append(f"domain {domain['id']} references unknown parent {domain['parent']}")
+    for project in inventory["projects"]:
+        if project["domain"] not in domain_ids:
+            errors.append(f"project {project['id']} references unknown domain {project['domain']}")
+        if not project.get("exists"):
+            warnings.append(f"project path is currently missing: {project['path']}")
+        for relation in project.get("related_projects", []):
+            if relation.get("project") not in project_ids:
+                errors.append(
+                    f"project {project['id']} references unknown related project {relation.get('project')}"
+                )
+        for rule in project.get("workspace_rules", []):
+            if not expand_path(rule["root"]).is_dir():
+                warnings.append(f"workspace root is currently missing: {rule['root']}")
+    for item in inventory["broken_sources"]:
+        errors.append(f"configured source missing: {item['path']}")
+    for workflow in inventory.get("workflows", []):
+        if workflow["domain"] not in domain_ids:
+            errors.append(f"workflow {workflow['id']} references unknown domain {workflow['domain']}")
+        if workflow.get("project") and workflow["project"] not in project_ids:
+            errors.append(f"workflow {workflow['id']} references unknown project {workflow['project']}")
+        elif workflow.get("project") and workflow["domain"] != project_domains[workflow["project"]]:
+            errors.append(
+                f"workflow {workflow['id']} domain {workflow['domain']} does not match "
+                f"project {workflow['project']} domain {project_domains[workflow['project']]}"
+            )
+        for step in workflow.get("steps", []):
+            if step not in skill_ids:
+                warnings.append(f"workflow {workflow['id']} step is currently unresolved: {step}")
+    for collision in inventory["collisions"]:
+        if collision.get("status") == "unresolved":
+            warnings.append(
+                f"{collision['severity']} unresolved same-name collision {collision['name']}: "
+                + ", ".join(collision["candidate_ids"])
+            )
+    for instruction in inventory["instructions"]:
+        if instruction.get("scope") == "project" and instruction.get("declared") and not instruction.get("exists"):
+            warnings.append(f"declared project instruction is missing: {instruction['path']}")
+        if instruction.get("scope") == "global" and not instruction.get("has_agent_brain"):
+            warnings.append(f"runtime adapter not connected: {instruction['path']}")
+    if "__AGENT_BRAIN_DATA__" in VIEW_PATH.read_text(encoding="utf-8") if VIEW_PATH.is_file() else False:
+        errors.append("dashboard still contains the unexpanded data placeholder")
+    return {"errors": errors, "warnings": warnings}
+
+
+def print_status(status: Dict[str, Any]) -> None:
+    context = status["context"]
+    project = context.get("project")
+    print("Agent Brain context")
+    print(f"  cwd:      {context['cwd']}")
+    print(f"  domain:   {context['domain']} ({context['source']})")
+    print(f"  project:  {project['id'] if project else 'none'}")
+    print(f"  chain:    {' -> '.join(context['chain'])}")
+    print(f"  skills:   {status['active_skill_count']} active, {status['excluded_skill_count']} excluded")
+    if status["active_collisions"]:
+        print(f"  warnings: {', '.join(status['active_collisions'])}")
+    else:
+        print("  warnings: none")
+
+
+def command_build(_: argparse.Namespace) -> int:
+    inventory = build_outputs()
+    stats = inventory["stats"]
+    print(
+        f"Built Agent Brain: {stats['skill_sources']} skill sources, "
+        f"{stats['project_count']} projects, {stats['collision_count']} collisions"
+    )
+    print(f"Dashboard: {VIEW_PATH}")
+    print(f"Canvas:    {CANVAS_PATH}")
+    print(f"Audit:     {AUDIT_PATH}")
+    return 0
+
+
+def command_init(args: argparse.Namespace) -> int:
+    if CONFIG_PATH.exists() and not args.force:
+        print(f"Registry already exists: {REGISTRY_DIR}")
+        print("Use --force only if you want to replace the starter files.", file=sys.stderr)
+        return 2
+    if not DEFAULTS_DIR.is_dir():
+        print(f"Starter registry is missing: {DEFAULTS_DIR}", file=sys.stderr)
+        return 1
+    REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+    for source in sorted(DEFAULTS_DIR.rglob("*")):
+        relative = source.relative_to(DEFAULTS_DIR)
+        destination = REGISTRY_DIR / relative
+        if source.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+        elif args.force or not destination.exists():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+    inventory = build_outputs()
+    print(f"Initialized Agent Brain registry: {REGISTRY_DIR}")
+    print(
+        f"Discovered {inventory['stats']['skill_sources']} skills from "
+        f"{inventory['stats']['skill_mounts']} runtime mounts."
+    )
+    print("Next: edit projects/*.json or use `brain project add /path/to/project`.")
+    return 0
+
+
+def command_project_add(args: argparse.Namespace) -> int:
+    if not CONFIG_PATH.is_file():
+        print(f"Registry is not initialized: {REGISTRY_DIR}. Run `brain init`.", file=sys.stderr)
+        return 2
+    project_path = safe_resolve(expand_path(args.path))
+    if not project_path.is_dir():
+        print(f"Project directory does not exist: {project_path}", file=sys.stderr)
+        return 2
+    domain_ids = {item["id"] for item in load_domains()}
+    if args.domain not in domain_ids:
+        print(f"Unknown domain: {args.domain}", file=sys.stderr)
+        print("Known domains: " + ", ".join(sorted(domain_ids)), file=sys.stderr)
+        return 2
+    project_id = slug(args.id or project_path.name)
+    destination = REGISTRY_DIR / "projects" / f"{project_id}.json"
+    if destination.exists() and not args.force:
+        print(f"Project already registered: {destination}", file=sys.stderr)
+        return 2
+    instruction_files = [name for name in ("AGENTS.md", "CLAUDE.md") if (project_path / name).is_file()]
+    skill_roots = [name for name in (".agents/skills", ".codex/skills", ".claude/skills") if (project_path / name).is_dir()]
+    manifest = {
+        "id": project_id,
+        "name": args.name or project_path.name.replace("-", " ").title(),
+        "path": str(project_path),
+        "domain": args.domain,
+        "description": args.description or "",
+        "kind": args.kind,
+        "aliases": [],
+        "instruction_files": instruction_files,
+        "skill_roots": skill_roots,
+        "related_projects": [],
+        "workspace_rules": [],
+    }
+    write_json(destination, manifest)
+    build_outputs()
+    print(f"Registered project {project_id}: {destination}")
+    return 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    inventory = load_or_build_inventory()
+    if args.domain and args.domain not in {item["id"] for item in inventory["domains"]}:
+        print(f"Unknown domain: {args.domain}", file=sys.stderr)
+        return 2
+    status = context_status(Path(args.cwd), inventory, args.domain)
+    if args.json:
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+    else:
+        print_status(status)
+    return 0
+
+
+def command_explain(args: argparse.Namespace) -> int:
+    inventory = load_or_build_inventory()
+    if args.domain and args.domain not in {item["id"] for item in inventory["domains"]}:
+        print(f"Unknown domain: {args.domain}", file=sys.stderr)
+        return 2
+    status = context_status(Path(args.cwd), inventory, args.domain)
+    result = select_skill(args.query, status, inventory)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["selected"] else 2
+    if not result["candidates"]:
+        print(f"No skill matches: {args.query}")
+        return 2
+    print(f"Query: {args.query}")
+    if result["selected"]:
+        selected = result["selected"]
+        print(f"Selected: {selected['id']}")
+        print(f"Reason:   {result['reason']}")
+        print(f"Source:   {selected['source_path']}")
+    else:
+        print(f"Selected: none")
+        print(f"Reason:   {result['reason']}")
+    print("Candidates:")
+    active_ids = set(status["active_skills"])
+    for candidate in result["candidates"]:
+        marker = "active" if candidate["id"] in active_ids else "excluded"
+        print(f"  - {candidate['id']} [{marker}] -> {candidate['source_path']}")
+    return 0 if result["selected"] else 2
+
+
+def command_validate(_: argparse.Namespace) -> int:
+    source_report = validate_source_manifests()
+    if source_report["errors"]:
+        payload = {
+            "ok": False,
+            "errors": source_report["errors"],
+            "warnings": source_report["warnings"],
+            "generated_at": None,
+            "stats": {},
+        }
+        if getattr(_, "json", False):
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print("Errors:")
+            for error in payload["errors"]:
+                print(f"  - {error}")
+            print(f"Validation failed: {len(payload['errors'])} source errors")
+        return 1
+    inventory = build_outputs()
+    report = validation_report(inventory)
+    if getattr(_, "json", False):
+        print(
+            json.dumps(
+                {
+                    "ok": not report["errors"],
+                    "errors": report["errors"],
+                    "warnings": report["warnings"],
+                    "generated_at": inventory["generated_at"],
+                    "stats": inventory["stats"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0 if not report["errors"] else 1
+    if report["errors"]:
+        print("Errors:")
+        for error in report["errors"]:
+            print(f"  - {error}")
+    if report["warnings"]:
+        print("Warnings:")
+        for warning in report["warnings"]:
+            print(f"  - {warning}")
+    if report["errors"]:
+        print(f"Validation failed: {len(report['errors'])} errors, {len(report['warnings'])} warnings")
+        return 1
+    print(f"Validation passed: {len(report['warnings'])} warnings")
+    return 0
+
+
+def command_use(args: argparse.Namespace) -> int:
+    if args.domain == "auto":
+        if STATE_PATH.exists():
+            STATE_PATH.unlink()
+        print("Explicit domain override cleared; context will be resolved automatically.")
+        return 0
+    domain_ids = {item["id"] for item in load_domains()}
+    if args.domain not in domain_ids:
+        print(f"Unknown domain: {args.domain}", file=sys.stderr)
+        print("Known domains: " + ", ".join(sorted(domain_ids)), file=sys.stderr)
+        return 2
+    write_json(
+        STATE_PATH,
+        {
+            "schema_version": "agent-brain.active-context.v1",
+            "domain": args.domain,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    print(f"Default domain override set to {args.domain}.")
+    return 0
+
+
+def command_hook(args: argparse.Namespace) -> int:
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        return 0
+    cwd = Path(payload.get("cwd") or os.getcwd())
+    inventory = load_or_build_inventory()
+    status = context_status(cwd, inventory)
+    context = status["context"]
+    project = context.get("project")
+    project_text = project["id"] if project else "none"
+    warning_text = ", ".join(status["active_collisions"][:5]) or "none"
+    workflow_text = ", ".join(status["active_workflows"]) or "none"
+    additional = (
+        "## Agent Brain routing context\n\n"
+        f"Runtime: {args.runtime}. Domain: `{context['domain']}`. "
+        f"Project: `{project_text}`. Resolution source: `{context['source']}`.\n"
+        f"Scope chain: `{' -> '.join(context['chain'])}`.\n"
+        "Automatically select only global skills plus skills belonging to this "
+        "domain/project. A runtime mount does not make a project skill global. "
+        "An explicitly named user skill still wins unless it violates higher-level rules.\n"
+        f"Active same-name ambiguities: {warning_text}. When ambiguous, run "
+        "`brain explain <skill> --cwd \"$PWD\"` before acting.\n"
+        f"Relevant registered workflows: {workflow_text}."
+    )
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": additional,
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+
+def command_serve(args: argparse.Namespace) -> int:
+    build_outputs()
+    url = f"http://{args.host}:{args.port}/index.html"
+    handler = lambda *handler_args, **handler_kwargs: http.server.SimpleHTTPRequestHandler(  # noqa: E731
+        *handler_args, directory=str(REGISTRY_DIR / "views"), **handler_kwargs
+    )
+    with ReusableTCPServer((args.host, args.port), handler) as server:
+        print(f"Agent Brain dashboard: {url}")
+        if args.open_browser:
+            threading.Timer(0.25, lambda: webbrowser.open(url)).start()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+    return 0
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Agent Brain context registry")
+    parser.add_argument(
+        "--registry",
+        default=os.environ.get("AGENT_BRAIN_HOME", str(DEFAULT_REGISTRY_DIR)),
+        help="registry directory (default: ~/.agent-brain or AGENT_BRAIN_HOME)",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    build_parser = subparsers.add_parser("build", help="rebuild inventory and visualizations")
+    build_parser.set_defaults(func=command_build)
+
+    init_parser = subparsers.add_parser("init", help="initialize a portable registry with starter domains")
+    init_parser.add_argument("--force", action="store_true", help="replace starter files that already exist")
+    init_parser.set_defaults(func=command_init)
+
+    project_parser = subparsers.add_parser("project", help="manage project manifests")
+    project_subparsers = project_parser.add_subparsers(dest="project_command", required=True)
+    project_add_parser = project_subparsers.add_parser("add", help="register an existing project directory")
+    project_add_parser.add_argument("path")
+    project_add_parser.add_argument("--id")
+    project_add_parser.add_argument("--name")
+    project_add_parser.add_argument("--domain", default="personal.software")
+    project_add_parser.add_argument("--description")
+    project_add_parser.add_argument("--kind", default="software-project")
+    project_add_parser.add_argument("--force", action="store_true")
+    project_add_parser.set_defaults(func=command_project_add)
+
+    status_parser = subparsers.add_parser("status", help="resolve active context")
+    status_parser.add_argument("--cwd", default=os.getcwd())
+    status_parser.add_argument("--domain")
+    status_parser.add_argument("--json", action="store_true")
+    status_parser.set_defaults(func=command_status)
+
+    explain_parser = subparsers.add_parser("explain", help="explain skill selection")
+    explain_parser.add_argument("query")
+    explain_parser.add_argument("--cwd", default=os.getcwd())
+    explain_parser.add_argument("--domain")
+    explain_parser.add_argument("--json", action="store_true")
+    explain_parser.set_defaults(func=command_explain)
+
+    validate_parser = subparsers.add_parser("validate", help="validate registry and generated outputs")
+    validate_parser.add_argument("--json", action="store_true")
+    validate_parser.set_defaults(func=command_validate)
+
+    use_parser = subparsers.add_parser("use", help="set a default domain override")
+    use_parser.add_argument("domain", help="domain ID or 'auto'")
+    use_parser.set_defaults(func=command_use)
+
+    hook_parser = subparsers.add_parser("hook", help="emit UserPromptSubmit context")
+    hook_parser.add_argument("--runtime", choices=["codex", "claude"], required=True)
+    hook_parser.set_defaults(func=command_hook)
+
+    serve_parser = subparsers.add_parser("serve", help="serve the dashboard locally")
+    serve_parser.add_argument("--host", default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=8765)
+    serve_parser.add_argument("--open-browser", action="store_true")
+    serve_parser.set_defaults(func=command_serve)
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = create_parser().parse_args(argv)
+    configure_paths(Path(args.registry))
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

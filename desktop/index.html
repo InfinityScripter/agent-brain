@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+    <title>Agent Brain</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></div>
+          <div><strong>Agent Brain</strong><span>LOCAL CONTROL PLANE</span></div>
+        </div>
+
+        <nav class="navigation" aria-label="Main navigation">
+          <button class="nav-item active" data-view="portfolio"><span>⌂</span>Portfolio<kbd>1</kbd></button>
+          <button class="nav-item" data-view="projects"><span>▦</span>Projects<kbd>2</kbd></button>
+          <button class="nav-item" data-view="graph"><span>⌘</span>Graph<kbd>3</kbd></button>
+          <button class="nav-item" data-view="simulator"><span>⌁</span>Simulator<kbd>4</kbd></button>
+          <button class="nav-item" data-view="conflicts"><span>△</span>Conflicts<kbd>5</kbd><b id="conflictBadge">—</b></button>
+          <button class="nav-item" data-view="health"><span>＋</span>Health<kbd>6</kbd></button>
+        </nav>
+
+        <div class="sidebar-spacer"></div>
+        <section class="runtime-card">
+          <div class="runtime-title"><span class="status-dot" id="runtimeDot"></span><span id="runtimeStatus">Registry loading</span></div>
+          <dl>
+            <div><dt>Sources</dt><dd id="sideSources">—</dd></div>
+            <div><dt>Projects</dt><dd id="sideProjects">—</dd></div>
+            <div><dt>Flows</dt><dd id="sideFlows">—</dd></div>
+          </dl>
+          <button id="refreshButton" class="refresh-button"><span>↻</span>Refresh registry</button>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="viewEyebrow">CONTEXT PORTFOLIO</p>
+            <h1 id="viewTitle">Your whole system — <em>in one place.</em></h1>
+          </div>
+          <div class="topbar-actions">
+            <label class="global-search"><span>⌕</span><input id="globalSearch" type="search" aria-label="Find a project or skill" placeholder="Find a project or skill…" autocomplete="off"><kbd>⌘K</kbd></label>
+            <button class="icon-button" id="validateButton" title="Validate registry" aria-label="Validate registry">✓</button>
+          </div>
+        </header>
+
+        <div id="notice" class="notice" role="status" hidden></div>
+
+        <section class="view active" id="view-portfolio" aria-labelledby="viewTitle">
+          <div class="metric-grid" id="metricGrid"></div>
+          <div class="section-heading">
+            <div><p class="eyebrow">DOMAIN MAP</p><h2>Contexts and projects</h2></div>
+            <p>Choose a domain to inspect its projects and real relationships.</p>
+          </div>
+          <div class="domain-grid" id="domainGrid"></div>
+          <div class="two-column">
+            <section class="panel">
+              <div class="panel-head"><div><p class="eyebrow">COVERAGE</p><h3>Project layer</h3></div><span id="coverageScore" class="score">—</span></div>
+              <div id="coverageList" class="coverage-list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head"><div><p class="eyebrow">WORKFLOWS</p><h3>Operational flows</h3></div><span id="workflowCount" class="muted-chip">—</span></div>
+              <div id="workflowList" class="workflow-list"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-projects">
+          <div class="toolbar">
+            <div class="segmented" id="projectFilters">
+              <button class="active" data-filter="all">All</button>
+              <button data-filter="work">Work</button>
+              <button data-filter="personal">Personal</button>
+              <button data-filter="creative">Creative</button>
+              <button data-filter="meta">Meta</button>
+            </div>
+            <div class="toolbar-actions"><span class="toolbar-count" id="projectCount">—</span><button id="addProjectButton" class="primary compact">Add project</button></div>
+          </div>
+          <div class="project-layout">
+            <div class="project-list" id="projectList"></div>
+            <aside class="project-detail" id="projectDetail"><div class="empty-state">Select a project</div></aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-graph">
+          <div class="graph-toolbar">
+            <div class="legend"><span class="legend-domain">Domain</span><span class="legend-project">Project</span><span class="legend-flow">Workflow</span><span class="legend-skill">Skill</span></div>
+            <label><span>Context</span><select id="graphDomain"></select></label>
+          </div>
+          <aside class="skill-inspector" id="skillInspector" hidden></aside>
+          <div class="graph-canvas" id="graphCanvas"><svg id="graphEdges" aria-hidden="true"></svg><div id="graphNodes"></div><ul id="graphRelations" class="sr-only" aria-label="Graph relationships"></ul></div>
+        </section>
+
+        <section class="view" id="view-simulator">
+          <div class="simulator-hero">
+            <div><p class="eyebrow">CONTEXT SIMULATOR</p><h2>What will the agent see?</h2><p>Resolve folder → workspace → project → domain before starting Codex or Claude.</p></div>
+            <div class="path-control"><input id="simulatorPath" type="text" spellcheck="false" aria-label="Path to simulate" placeholder="~/Projects/example"><button id="choosePath">Choose…</button><button id="simulateButton" class="primary">Resolve</button></div>
+          </div>
+          <div id="simulationResult" class="simulation-result empty-state">Choose a folder or paste a path.</div>
+        </section>
+
+        <section class="view" id="view-conflicts">
+          <div class="toolbar">
+            <div class="segmented" id="conflictFilters"><button class="active" data-filter="all">All</button><button data-filter="unresolved">Needs attention</button><button data-filter="resolved">Resolved by context</button></div>
+            <span class="toolbar-count" id="conflictCount">—</span>
+          </div>
+          <div class="conflict-list" id="conflictList"></div>
+        </section>
+
+        <section class="view" id="view-health">
+          <div class="health-hero" id="healthHero"><div class="health-ring"><span id="healthScore">—</span></div><div><p class="eyebrow">SEMANTIC VALIDATION</p><h2 id="healthTitle">Checking the system…</h2><p id="healthSummary">Routing, manifests, instructions, workflows, and sources.</p></div><button id="runHealth" class="primary">Run validation</button></div>
+          <div class="health-grid"><section class="panel"><div class="panel-head"><h3>Errors</h3><span class="danger-chip" id="errorCount">—</span></div><div id="errorList" class="issue-list"></div></section><section class="panel"><div class="panel-head"><h3>Warnings</h3><span class="warn-chip" id="warningCount">—</span></div><div id="warningList" class="issue-list"></div></section></div>
+        </section>
+
+        <section class="search-overlay" id="searchOverlay" hidden><div class="search-results" id="searchResults"></div></section>
+      </main>
+    </div>
+
+    <div class="loading-screen" id="loadingScreen">
+      <div class="loading-mark"><i></i><i></i><i></i></div>
+      <p id="loadingMessage">Building Agent Brain…</p>
+      <button id="loadingRetry" class="primary" hidden>Retry</button>
+    </div>
+    <dialog id="projectDialog" class="project-dialog">
+      <form id="projectForm">
+        <div class="dialog-head"><div><p class="eyebrow">PROJECT REGISTRY</p><h2>Add a project</h2></div><button type="button" id="closeProjectDialog" class="icon-button" aria-label="Close">×</button></div>
+        <p>Agent Brain will detect AGENTS.md, CLAUDE.md, and local skill folders automatically.</p>
+        <label>Folder<input id="projectPath" name="path" readonly required></label>
+        <label>Name<input id="projectName" name="name" maxlength="128" placeholder="Optional display name"></label>
+        <label>Domain<select id="projectDomain" name="domain" required></select></label>
+        <label>Description<textarea id="projectDescription" name="description" maxlength="512" placeholder="Optional context for agents"></textarea></label>
+        <div class="dialog-actions"><button type="button" id="cancelProjectDialog">Cancel</button><button type="submit" class="primary">Add project</button></div>
+      </form>
+    </dialog>
+    <script src="renderer.js"></script>
+  </body>
+</html>
