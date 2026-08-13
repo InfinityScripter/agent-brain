@@ -363,12 +363,14 @@ def validate_source_manifests(base_dir: Optional[Path] = None) -> Dict[str, List
                         or any(not isinstance(name, str) or not name.strip() for name in rule["names"])
                     ):
                         errors.append(f"config/brain.json: {rule_name}[{index}].names must be an array of strings")
-                    if rule.get("level") not in {"global", "domain", "plugin", "archive"}:
+                    if rule.get("level") not in {"global", "domain", "project", "plugin", "archive"}:
                         errors.append(f"config/brain.json: {rule_name}[{index}].level is invalid")
                     if rule.get("level") == "domain" and not isinstance(rule.get("domain"), str):
                         errors.append(f"config/brain.json: {rule_name}[{index}].domain is required")
                     if rule.get("level") == "plugin" and not isinstance(rule.get("plugin"), str):
                         errors.append(f"config/brain.json: {rule_name}[{index}].plugin is required")
+                    if rule.get("level") == "project" and not isinstance(rule.get("project"), str):
+                        errors.append(f"config/brain.json: {rule_name}[{index}].project is required")
                 else:
                     if not isinstance(rule.get("priority"), int):
                         errors.append(f"config/brain.json: {rule_name}[{index}].priority must be an integer")
@@ -509,8 +511,20 @@ def classify_scope(
     source: Path,
     config: Dict[str, Any],
     projects: Sequence[Dict[str, Any]],
+    declared_project: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Optional[str]]:
     source_text = str(source)
+    for rule in config.get("skill_scope_rules", []):
+        names = rule.get("names", [])
+        source_pattern = rule.get("source_pattern")
+        if (names and name in names) or (source_pattern and re.search(source_pattern, source_text)):
+            return {
+                "level": rule["level"],
+                "domain": rule.get("domain"),
+                "project": rule.get("project"),
+                "plugin": rule.get("plugin"),
+            }
+
     if "skill-snapshots" in source_text or "-workspace/skill-snapshot" in source_text:
         return {"level": "archive", "domain": None, "project": None, "plugin": None}
 
@@ -523,16 +537,13 @@ def classify_scope(
             "plugin": None,
         }
 
-    for rule in config.get("skill_scope_rules", []):
-        names = rule.get("names", [])
-        source_pattern = rule.get("source_pattern")
-        if (names and name in names) or (source_pattern and re.search(source_pattern, source_text)):
-            return {
-                "level": rule["level"],
-                "domain": rule.get("domain"),
-                "project": None,
-                "plugin": rule.get("plugin"),
-            }
+    if declared_project:
+        return {
+            "level": "project",
+            "domain": declared_project["domain"],
+            "project": declared_project["id"],
+            "plugin": None,
+        }
 
     plugin = plugin_identity(source)
     if plugin:
@@ -621,16 +632,11 @@ def collect_skill_occurrences(
             seen_mount_runtime.add(mount_key)
             source_dir = safe_resolve(skill_file.parent)
             metadata = parse_skill_metadata(skill_file, mount_dir.name)
-            scope = (
-                {
-                    "level": "project",
-                    "domain": root_spec["domain"],
-                    "project": root_spec["project"],
-                    "plugin": None,
-                }
-                if root_spec.get("project")
-                else classify_scope(metadata["name"], source_dir, config, projects)
+            declared_project = next(
+                (project for project in projects if project["id"] == root_spec.get("project")),
+                None,
             )
+            scope = classify_scope(metadata["name"], source_dir, config, projects, declared_project)
             occurrences.append(
                 {
                     "logical_name": metadata["name"],
@@ -1377,6 +1383,8 @@ def validation_report(inventory: Dict[str, Any]) -> Dict[str, List[str]]:
     for rule in config.get("skill_scope_rules", []):
         if rule.get("level") == "domain" and rule.get("domain") not in domain_ids:
             errors.append(f"config skill scope rule references unknown domain {rule.get('domain')}")
+        if rule.get("level") == "project" and rule.get("project") not in project_ids:
+            errors.append(f"config skill scope rule references unknown project {rule.get('project')}")
     for domain in inventory["domains"]:
         if domain.get("parent") and domain["parent"] not in domain_ids:
             errors.append(f"domain {domain['id']} references unknown parent {domain['parent']}")
@@ -1515,6 +1523,390 @@ def command_project_add(args: argparse.Namespace) -> int:
     write_json(destination, manifest)
     build_outputs()
     print(f"Registered project {project_id}: {destination}")
+    return 0
+
+
+def project_manifest(project_id: str) -> Tuple[Path, Dict[str, Any]]:
+    for path in sorted((REGISTRY_DIR / "projects").glob("*.json")):
+        project = read_json(path)
+        if project.get("id") == project_id:
+            return path, project
+    raise ValueError(f"Unknown project: {project_id}")
+
+
+def project_dependencies(project_id: str) -> Dict[str, Any]:
+    incoming_relations = []
+    for path in sorted((REGISTRY_DIR / "projects").glob("*.json")):
+        project = read_json(path)
+        for relation in project.get("related_projects", []):
+            if relation.get("project") == project_id:
+                incoming_relations.append(
+                    {"project": project["id"], "type": relation.get("type", "related")}
+                )
+    workflows = [
+        workflow["id"]
+        for workflow in load_workflows()
+        if workflow.get("project") == project_id
+    ]
+    return {
+        "project": project_id,
+        "incoming_relations": incoming_relations,
+        "workflows": workflows,
+    }
+
+
+def command_project_dependencies(args: argparse.Namespace) -> int:
+    try:
+        project_manifest(args.id)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    dependencies = project_dependencies(args.id)
+    if args.json:
+        print(json.dumps(dependencies, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"{args.id}: {len(dependencies['incoming_relations'])} incoming relations, "
+            f"{len(dependencies['workflows'])} workflows"
+        )
+    return 0
+
+
+def command_project_update(args: argparse.Namespace) -> int:
+    try:
+        destination, project = project_manifest(args.id)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    if args.domain is not None:
+        domain_ids = {item["id"] for item in load_domains()}
+        if args.domain not in domain_ids:
+            print(f"Unknown domain: {args.domain}", file=sys.stderr)
+            return 2
+        project["domain"] = args.domain
+    if args.name is not None:
+        if not args.name.strip():
+            print("Project name cannot be empty", file=sys.stderr)
+            return 2
+        project["name"] = args.name.strip()
+    if args.description is not None:
+        project["description"] = args.description.strip()
+    if args.kind is not None:
+        if not args.kind.strip():
+            print("Project kind cannot be empty", file=sys.stderr)
+            return 2
+        project["kind"] = args.kind.strip()
+    if args.relations_json is not None:
+        try:
+            relations = json.loads(args.relations_json)
+        except json.JSONDecodeError as error:
+            print(f"Invalid relations JSON: {error}", file=sys.stderr)
+            return 2
+        project_ids = {item["id"] for item in load_projects()}
+        if not isinstance(relations, list):
+            print("Related projects must be an array", file=sys.stderr)
+            return 2
+        seen_relations = set()
+        for relation in relations:
+            if not isinstance(relation, dict) or not all(
+                isinstance(relation.get(key), str) and relation[key].strip()
+                for key in ("project", "type")
+            ):
+                print("Every project relation needs non-empty project and type strings", file=sys.stderr)
+                return 2
+            if relation["project"] not in project_ids or relation["project"] == args.id:
+                print(f"Invalid related project: {relation['project']}", file=sys.stderr)
+                return 2
+            key = (relation["project"], relation["type"])
+            if key in seen_relations:
+                print(f"Duplicate project relation: {relation['type']} {relation['project']}", file=sys.stderr)
+                return 2
+            seen_relations.add(key)
+        project["related_projects"] = relations
+    if args.workspace_rules_json is not None:
+        try:
+            workspace_rules = json.loads(args.workspace_rules_json)
+        except json.JSONDecodeError as error:
+            print(f"Invalid workspace rules JSON: {error}", file=sys.stderr)
+            return 2
+        if not isinstance(workspace_rules, list):
+            print("Workspace rules must be an array", file=sys.stderr)
+            return 2
+        for rule in workspace_rules:
+            if not isinstance(rule, dict) or not isinstance(rule.get("root"), str) or not rule["root"].strip():
+                print("Every workspace rule needs a non-empty root", file=sys.stderr)
+                return 2
+            if "project_path" in rule and not isinstance(rule["project_path"], str):
+                print("Workspace project_path must be a string", file=sys.stderr)
+                return 2
+            if "dynamic_child" in rule and not isinstance(rule["dynamic_child"], bool):
+                print("Workspace dynamic_child must be a boolean", file=sys.stderr)
+                return 2
+            if "kind" in rule and (not isinstance(rule["kind"], str) or not rule["kind"].strip()):
+                print("Workspace kind must be a non-empty string", file=sys.stderr)
+                return 2
+        project["workspace_rules"] = workspace_rules
+
+    write_json(destination, project)
+    if args.domain is not None:
+        for workflow_path in sorted((REGISTRY_DIR / "workflows").glob("**/*.json")):
+            workflow = read_json(workflow_path)
+            if workflow.get("project") == args.id and workflow.get("domain") != args.domain:
+                workflow["domain"] = args.domain
+                write_json(workflow_path, workflow)
+    build_outputs()
+    print(f"Updated project {args.id}: {destination}")
+    return 0
+
+
+def command_project_delete(args: argparse.Namespace) -> int:
+    try:
+        destination, _project = project_manifest(args.id)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    dependencies = project_dependencies(args.id)
+    if (dependencies["incoming_relations"] or dependencies["workflows"]) and not args.cascade:
+        print(json.dumps(dependencies, ensure_ascii=False), file=sys.stderr)
+        print("Project has dependencies; repeat with --cascade to remove their references", file=sys.stderr)
+        return 2
+
+    if args.cascade:
+        for project_path in sorted((REGISTRY_DIR / "projects").glob("*.json")):
+            project = read_json(project_path)
+            relations = project.get("related_projects", [])
+            filtered = [relation for relation in relations if relation.get("project") != args.id]
+            if filtered != relations:
+                project["related_projects"] = filtered
+                write_json(project_path, project)
+        for workflow_path in sorted((REGISTRY_DIR / "workflows").glob("**/*.json")):
+            workflow = read_json(workflow_path)
+            if workflow.get("project") == args.id:
+                workflow_path.unlink()
+    destination.unlink()
+    build_outputs()
+    print(f"Deleted project manifest {args.id}; external project files were not changed")
+    return 0
+
+
+def command_workflow_save(args: argparse.Namespace) -> int:
+    domain_ids = {item["id"] for item in load_domains()}
+    projects = {item["id"]: item for item in load_projects()}
+    if args.domain not in domain_ids:
+        print(f"Unknown domain: {args.domain}", file=sys.stderr)
+        return 2
+    if args.project and args.project not in projects:
+        print(f"Unknown project: {args.project}", file=sys.stderr)
+        return 2
+    if args.project and projects[args.project]["domain"] != args.domain:
+        print("Workflow domain must match its project domain", file=sys.stderr)
+        return 2
+    if not args.name.strip():
+        print("Workflow name cannot be empty", file=sys.stderr)
+        return 2
+    try:
+        steps = json.loads(args.steps_json)
+    except json.JSONDecodeError as error:
+        print(f"Invalid workflow steps JSON: {error}", file=sys.stderr)
+        return 2
+    if not isinstance(steps, list) or any(not isinstance(step, str) or not step.strip() for step in steps):
+        print("Workflow steps must be an array of non-empty skill IDs", file=sys.stderr)
+        return 2
+    workflow_id = slug(args.id)
+    existing = next(
+        (
+            path for path in sorted((REGISTRY_DIR / "workflows").glob("**/*.json"))
+            if read_json(path).get("id") == workflow_id
+        ),
+        None,
+    )
+    destination = existing or REGISTRY_DIR / "workflows" / f"{workflow_id}.json"
+    if existing and not args.force:
+        print(f"Workflow already exists: {workflow_id}", file=sys.stderr)
+        return 2
+    write_json(destination, {
+        "id": workflow_id,
+        "name": args.name.strip(),
+        "domain": args.domain,
+        "project": args.project,
+        "description": args.description.strip(),
+        "steps": [step.strip() for step in steps],
+    })
+    build_outputs()
+    print(f"Saved workflow {workflow_id}: {destination}")
+    return 0
+
+
+def command_workflow_delete(args: argparse.Namespace) -> int:
+    workflow_id = slug(args.id)
+    destination = next(
+        (
+            path for path in sorted((REGISTRY_DIR / "workflows").glob("**/*.json"))
+            if read_json(path).get("id") == workflow_id
+        ),
+        None,
+    )
+    if destination is None:
+        print(f"Unknown workflow: {args.id}", file=sys.stderr)
+        return 2
+    destination.unlink()
+    build_outputs()
+    print(f"Deleted workflow {args.id}")
+    return 0
+
+
+def domain_manifest(domain_id: str) -> Tuple[Path, Dict[str, Any]]:
+    for path in sorted((REGISTRY_DIR / "domains").glob("**/domain.json")):
+        domain = read_json(path)
+        if domain.get("id") == domain_id:
+            return path, domain
+    raise ValueError(f"Unknown domain: {domain_id}")
+
+
+def command_domain_save(args: argparse.Namespace) -> int:
+    domain_ids = {item["id"] for item in load_domains()}
+    domain_id = args.id.strip()
+    if not re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)*", domain_id):
+        print("Domain ID must contain lowercase letters, digits, dots, or hyphens", file=sys.stderr)
+        return 2
+    if not args.name.strip():
+        print("Domain name cannot be empty", file=sys.stderr)
+        return 2
+    if not re.fullmatch(r"#[0-9A-Fa-f]{6}", args.color):
+        print("Domain color must be a six-digit hex color", file=sys.stderr)
+        return 2
+    if not args.icon.strip():
+        print("Domain icon cannot be empty", file=sys.stderr)
+        return 2
+    if args.parent and (args.parent not in domain_ids or args.parent == domain_id):
+        print(f"Invalid parent domain: {args.parent}", file=sys.stderr)
+        return 2
+    if args.parent:
+        parents = {item["id"]: item.get("parent") for item in load_domains()}
+        cursor = args.parent
+        while cursor:
+            if cursor == domain_id:
+                print("Domain parent would create a cycle", file=sys.stderr)
+                return 2
+            cursor = parents.get(cursor)
+    try:
+        destination, domain = domain_manifest(domain_id)
+        if not args.force:
+            print(f"Domain already exists: {domain_id}", file=sys.stderr)
+            return 2
+    except ValueError:
+        destination = REGISTRY_DIR / "domains" / Path(*domain_id.split(".")) / "domain.json"
+        domain = {"id": domain_id}
+    domain.update({
+        "name": args.name.strip(), "description": args.description.strip(),
+        "parent": args.parent, "color": args.color, "icon": args.icon.strip()
+    })
+    write_json(destination, domain)
+    build_outputs()
+    print(f"Saved domain {domain_id}: {destination}")
+    return 0
+
+
+def command_domain_dependencies(args: argparse.Namespace) -> int:
+    try:
+        domain_manifest(args.id)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    config = read_json(CONFIG_PATH)
+    config_references = []
+    if config.get("default_domain") == args.id:
+        config_references.append("default_domain")
+    if any(rule.get("domain") == args.id for rule in config.get("domain_path_rules", [])):
+        config_references.append("domain_path_rules")
+    if any(rule.get("domain") == args.id for rule in config.get("skill_scope_rules", [])):
+        config_references.append("skill_scope_rules")
+    dependencies = {
+        "domain": args.id,
+        "children": [item["id"] for item in load_domains() if item.get("parent") == args.id],
+        "projects": [item["id"] for item in load_projects() if item.get("domain") == args.id],
+        "workflows": [item["id"] for item in load_workflows() if item.get("domain") == args.id],
+        "config_references": config_references,
+    }
+    print(json.dumps(dependencies, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_domain_delete(args: argparse.Namespace) -> int:
+    try:
+        destination, _domain = domain_manifest(args.id)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    config = read_json(CONFIG_PATH)
+    dependencies = {
+        "children": [item["id"] for item in load_domains() if item.get("parent") == args.id],
+        "projects": [item["id"] for item in load_projects() if item.get("domain") == args.id],
+        "workflows": [item["id"] for item in load_workflows() if item.get("domain") == args.id],
+        "config_references": [
+            label for label, active in (
+                ("default_domain", config.get("default_domain") == args.id),
+                ("domain_path_rules", any(rule.get("domain") == args.id for rule in config.get("domain_path_rules", []))),
+                ("skill_scope_rules", any(rule.get("domain") == args.id for rule in config.get("skill_scope_rules", []))),
+            ) if active
+        ],
+    }
+    if any(dependencies.values()):
+        print(json.dumps(dependencies, ensure_ascii=False), file=sys.stderr)
+        print("Move or delete dependent items before deleting this domain", file=sys.stderr)
+        return 2
+    destination.unlink()
+    for parent in destination.parents:
+        if parent == REGISTRY_DIR / "domains" or any(parent.iterdir()): break
+        parent.rmdir()
+    build_outputs()
+    print(f"Deleted domain {args.id}")
+    return 0
+
+
+def command_skill_scope(args: argparse.Namespace) -> int:
+    inventory = build_inventory()
+    skill = next((item for item in inventory["skills"] if item["id"] == args.id), None)
+    if skill is None:
+        print(f"Unknown skill: {args.id}", file=sys.stderr)
+        return 2
+    if args.level == "domain" and args.domain not in {item["id"] for item in inventory["domains"]}:
+        print(f"Unknown domain: {args.domain}", file=sys.stderr)
+        return 2
+    if args.level == "project" and args.project not in {item["id"] for item in inventory["projects"]}:
+        print(f"Unknown project: {args.project}", file=sys.stderr)
+        return 2
+    if args.level == "plugin" and not args.plugin:
+        print("Plugin ID is required for plugin scope", file=sys.stderr)
+        return 2
+    config = read_json(CONFIG_PATH)
+    marker = "gui-source:" + hashlib.sha256(skill["source_path"].encode("utf-8")).hexdigest()[:16]
+    rules = [
+        rule for rule in config.get("skill_scope_rules", [])
+        if rule.get("managed_by") != marker
+        and not (
+            isinstance(rule.get("managed_by"), str)
+            and rule["managed_by"].startswith("gui-source:")
+            and rule.get("source_pattern") == f"^{re.escape(skill['source_path'])}$"
+        )
+    ]
+    if args.level != "auto":
+        rule = {
+            "source_pattern": f"^{re.escape(skill['source_path'])}$",
+            "level": args.level,
+            "managed_by": marker,
+        }
+        if args.level == "domain": rule["domain"] = args.domain
+        if args.level == "project":
+            project = next(item for item in inventory["projects"] if item["id"] == args.project)
+            rule["project"] = args.project
+            rule["domain"] = project["domain"]
+        if args.level == "plugin": rule["plugin"] = args.plugin
+        rules.insert(0, rule)
+    config["skill_scope_rules"] = rules
+    write_json(CONFIG_PATH, config)
+    build_outputs()
+    print(f"Updated scope for {args.id}")
     return 0
 
 
@@ -1721,6 +2113,66 @@ def create_parser() -> argparse.ArgumentParser:
     project_add_parser.add_argument("--kind", default="software-project")
     project_add_parser.add_argument("--force", action="store_true")
     project_add_parser.set_defaults(func=command_project_add)
+    project_update_parser = project_subparsers.add_parser("update", help="update project metadata")
+    project_update_parser.add_argument("id")
+    project_update_parser.add_argument("--name")
+    project_update_parser.add_argument("--domain")
+    project_update_parser.add_argument("--description")
+    project_update_parser.add_argument("--kind")
+    project_update_parser.add_argument("--relations-json")
+    project_update_parser.add_argument("--workspace-rules-json")
+    project_update_parser.set_defaults(func=command_project_update)
+    project_dependencies_parser = project_subparsers.add_parser("dependencies", help="show project dependencies")
+    project_dependencies_parser.add_argument("id")
+    project_dependencies_parser.add_argument("--json", action="store_true")
+    project_dependencies_parser.set_defaults(func=command_project_dependencies)
+    project_delete_parser = project_subparsers.add_parser("delete", help="delete a project manifest")
+    project_delete_parser.add_argument("id")
+    project_delete_parser.add_argument("--cascade", action="store_true")
+    project_delete_parser.set_defaults(func=command_project_delete)
+
+    workflow_parser = subparsers.add_parser("workflow", help="manage workflow manifests")
+    workflow_subparsers = workflow_parser.add_subparsers(dest="workflow_command", required=True)
+    workflow_save_parser = workflow_subparsers.add_parser("save", help="create or update a workflow")
+    workflow_save_parser.add_argument("id")
+    workflow_save_parser.add_argument("--name", required=True)
+    workflow_save_parser.add_argument("--domain", required=True)
+    workflow_save_parser.add_argument("--project")
+    workflow_save_parser.add_argument("--description", default="")
+    workflow_save_parser.add_argument("--steps-json", required=True)
+    workflow_save_parser.add_argument("--force", action="store_true")
+    workflow_save_parser.set_defaults(func=command_workflow_save)
+    workflow_delete_parser = workflow_subparsers.add_parser("delete", help="delete a workflow")
+    workflow_delete_parser.add_argument("id")
+    workflow_delete_parser.set_defaults(func=command_workflow_delete)
+
+    domain_parser = subparsers.add_parser("domain", help="manage domain manifests")
+    domain_subparsers = domain_parser.add_subparsers(dest="domain_command", required=True)
+    domain_save_parser = domain_subparsers.add_parser("save", help="create or update a domain")
+    domain_save_parser.add_argument("id")
+    domain_save_parser.add_argument("--name", required=True)
+    domain_save_parser.add_argument("--description", default="")
+    domain_save_parser.add_argument("--parent")
+    domain_save_parser.add_argument("--color", default="#4AA8FF")
+    domain_save_parser.add_argument("--icon", default="circle")
+    domain_save_parser.add_argument("--force", action="store_true")
+    domain_save_parser.set_defaults(func=command_domain_save)
+    domain_dependencies_parser = domain_subparsers.add_parser("dependencies", help="show domain dependencies")
+    domain_dependencies_parser.add_argument("id")
+    domain_dependencies_parser.set_defaults(func=command_domain_dependencies)
+    domain_delete_parser = domain_subparsers.add_parser("delete", help="delete an empty domain")
+    domain_delete_parser.add_argument("id")
+    domain_delete_parser.set_defaults(func=command_domain_delete)
+
+    skill_parser = subparsers.add_parser("skill", help="manage skill ownership overrides")
+    skill_subparsers = skill_parser.add_subparsers(dest="skill_command", required=True)
+    skill_scope_parser = skill_subparsers.add_parser("scope", help="change a skill scope")
+    skill_scope_parser.add_argument("id")
+    skill_scope_parser.add_argument("--level", choices=["auto", "global", "domain", "project", "plugin", "archive"], required=True)
+    skill_scope_parser.add_argument("--domain")
+    skill_scope_parser.add_argument("--project")
+    skill_scope_parser.add_argument("--plugin")
+    skill_scope_parser.set_defaults(func=command_skill_scope)
 
     status_parser = subparsers.add_parser("status", help="resolve active context")
     status_parser.add_argument("--cwd", default=os.getcwd())

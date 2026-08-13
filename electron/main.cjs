@@ -84,8 +84,51 @@ function registerIpc() {
     return brain.addProject(payload.path, {
       name: payload.name,
       domain: payload.domain,
-      description: payload.description
+      description: payload.description,
+      kind: payload.kind
     });
+  }));
+  ipcMain.handle('brain:update-project', trusted((payload) => {
+    if (!payload || typeof payload !== 'object') throw new TypeError('Invalid project payload');
+    return brain.updateProject(payload.id, {
+      name: payload.name,
+      domain: payload.domain,
+      description: payload.description,
+      kind: payload.kind,
+      relatedProjects: payload.relatedProjects,
+      workspaceRules: payload.workspaceRules
+    });
+  }));
+  ipcMain.handle('brain:project-dependencies', trusted((projectId) => brain.projectDependencies(projectId)));
+  ipcMain.handle('brain:delete-project', trusted((payload) => {
+    if (!payload || typeof payload !== 'object') throw new TypeError('Invalid project delete payload');
+    if (payload.cascade !== true) throw new TypeError('Project deletion must be explicitly confirmed');
+    return brain.deleteProject(payload.id, { cascade: true });
+  }));
+  ipcMain.handle('brain:save-workflow', trusted((payload) => {
+    if (!payload || typeof payload !== 'object') throw new TypeError('Invalid workflow payload');
+    return brain.saveWorkflow(payload);
+  }));
+  ipcMain.handle('brain:delete-workflow', trusted((payload) => {
+    if (!payload || typeof payload !== 'object' || payload.confirmed !== true) {
+      throw new TypeError('Workflow deletion must be explicitly confirmed');
+    }
+    return brain.deleteWorkflow(payload.id);
+  }));
+  ipcMain.handle('brain:save-domain', trusted((payload) => {
+    if (!payload || typeof payload !== 'object') throw new TypeError('Invalid domain payload');
+    return brain.saveDomain(payload);
+  }));
+  ipcMain.handle('brain:domain-dependencies', trusted((domainId) => brain.domainDependencies(domainId)));
+  ipcMain.handle('brain:delete-domain', trusted((payload) => {
+    if (!payload || typeof payload !== 'object' || payload.confirmed !== true) {
+      throw new TypeError('Domain deletion must be explicitly confirmed');
+    }
+    return brain.deleteDomain(payload.id);
+  }));
+  ipcMain.handle('brain:update-skill-scope', trusted((payload) => {
+    if (!payload || typeof payload !== 'object') throw new TypeError('Invalid skill scope payload');
+    return brain.updateSkillScope(payload);
   }));
   ipcMain.handle('system:choose-directory', trusted(async () => {
     const result = await dialog.showOpenDialog(mainWindow, {

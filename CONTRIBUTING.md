@@ -16,8 +16,23 @@ AGENT_BRAIN_HOME=/tmp/agent-brain-dev npm start
 ```bash
 npm run test:python
 npm test
+npm run test:visual
 npm run test:public
 ```
+
+Visual regression tests launch the real Electron renderer against a synthetic,
+deterministic registry and compare seventeen key UI states with reviewed PNG
+baselines. The committed baselines target the GitHub-hosted `macos-26` ARM64
+image. Tests run with Electron's GPU disabled and fixed locale,
+timezone, viewport, and motion settings. When an intentional UI change affects
+the screenshots, regenerate them with:
+
+```bash
+npm run test:visual:update
+```
+
+Review every changed image before committing it. CI uploads the actual,
+expected, and diff images from `output/playwright/` when a comparison fails.
 
 On macOS, Electron changes must also pass:
 

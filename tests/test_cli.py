@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -60,6 +61,107 @@ class AgentBrainCliTests(unittest.TestCase):
             )
             self.assertEqual(safe_id.returncode, 0, safe_id.stderr)
             self.assertTrue((registry / "projects" / "safe-id.json").is_file())
+
+    def test_project_update_dependencies_and_safe_delete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            registry = home / ".agent-brain"
+            first = home / "Projects" / "first"
+            second = home / "Projects" / "second"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            self.assertEqual(self.run_brain(home, registry, "init").returncode, 0)
+            self.assertEqual(self.run_brain(home, registry, "project", "add", str(first), "--domain", "personal.software").returncode, 0)
+            self.assertEqual(self.run_brain(home, registry, "project", "add", str(second), "--domain", "personal.software").returncode, 0)
+
+            second_manifest = registry / "projects" / "second.json"
+            second_data = json.loads(second_manifest.read_text(encoding="utf-8"))
+            second_data["related_projects"] = [{"project": "first", "type": "uses"}]
+            second_manifest.write_text(json.dumps(second_data), encoding="utf-8")
+            workflow = registry / "workflows" / "first.json"
+            workflow.write_text(json.dumps({
+                "id": "first-flow", "name": "First flow", "domain": "personal.software",
+                "project": "first", "description": "", "steps": []
+            }), encoding="utf-8")
+
+            dependencies = self.run_brain(home, registry, "project", "dependencies", "first", "--json")
+            self.assertEqual(dependencies.returncode, 0, dependencies.stderr)
+            self.assertIn('"project": "second"', dependencies.stdout)
+            self.assertIn('"first-flow"', dependencies.stdout)
+
+            blocked = self.run_brain(home, registry, "project", "delete", "first")
+            self.assertEqual(blocked.returncode, 2)
+            self.assertTrue((registry / "projects" / "first.json").is_file())
+
+            updated = self.run_brain(
+                home, registry, "project", "update", "first", "--name", "First Product",
+                "--domain", "work", "--description", "Moved to work"
+            )
+            self.assertEqual(updated.returncode, 0, updated.stderr)
+            updated_data = json.loads((registry / "projects" / "first.json").read_text(encoding="utf-8"))
+            self.assertEqual(updated_data["name"], "First Product")
+            self.assertEqual(updated_data["domain"], "work")
+            workflow_data = json.loads(workflow.read_text(encoding="utf-8"))
+            self.assertEqual(workflow_data["domain"], "work")
+
+            deleted = self.run_brain(home, registry, "project", "delete", "first", "--cascade")
+            self.assertEqual(deleted.returncode, 0, deleted.stderr)
+            self.assertFalse((registry / "projects" / "first.json").exists())
+            self.assertTrue(first.is_dir())
+            self.assertFalse(workflow.exists())
+            second_data = json.loads(second_manifest.read_text(encoding="utf-8"))
+            self.assertEqual(second_data["related_projects"], [])
+
+    def test_domain_workflow_and_skill_scope_crud(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            registry = home / ".agent-brain"
+            project = home / "Projects" / "sample"
+            skill = project / ".agents" / "skills" / "review"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("---\nname: review\ndescription: Review\n---\n", encoding="utf-8")
+            self.assertEqual(self.run_brain(home, registry, "init").returncode, 0)
+
+            created_domain = self.run_brain(
+                home, registry, "domain", "save", "work.studio", "--name", "Studio",
+                "--description", "Studio work", "--parent", "work", "--color", "#123456"
+            )
+            self.assertEqual(created_domain.returncode, 0, created_domain.stderr)
+            self.assertEqual(self.run_brain(home, registry, "project", "add", str(project), "--domain", "work.studio").returncode, 0)
+
+            created_workflow = self.run_brain(
+                home, registry, "workflow", "save", "delivery", "--name", "Delivery",
+                "--domain", "work.studio", "--project", "sample", "--steps-json", "[]"
+            )
+            self.assertEqual(created_workflow.returncode, 0, created_workflow.stderr)
+            updated_workflow = self.run_brain(
+                home, registry, "workflow", "save", "delivery", "--name", "Delivery 2",
+                "--domain", "work.studio", "--project", "sample", "--steps-json", "[]", "--force"
+            )
+            self.assertEqual(updated_workflow.returncode, 0, updated_workflow.stderr)
+            workflows = list((registry / "workflows").glob("*.json"))
+            self.assertEqual(len(workflows), 1)
+            self.assertEqual(json.loads(workflows[0].read_text(encoding="utf-8"))["name"], "Delivery 2")
+
+            scope = self.run_brain(
+                home, registry, "skill", "scope", "project.sample.review",
+                "--level", "domain", "--domain", "work.studio"
+            )
+            self.assertEqual(scope.returncode, 0, scope.stderr)
+            inventory = json.loads((registry / "data" / "inventory.json").read_text(encoding="utf-8"))
+            self.assertTrue(any(item["id"] == "domain.work.studio.review" for item in inventory["skills"]))
+            automatic = self.run_brain(
+                home, registry, "skill", "scope", "domain.work.studio.review", "--level", "auto"
+            )
+            self.assertEqual(automatic.returncode, 0, automatic.stderr)
+            inventory = json.loads((registry / "data" / "inventory.json").read_text(encoding="utf-8"))
+            self.assertTrue(any(item["id"] == "project.sample.review" for item in inventory["skills"]))
+
+            blocked_domain = self.run_brain(home, registry, "domain", "delete", "work.studio")
+            self.assertEqual(blocked_domain.returncode, 2)
+            self.assertEqual(self.run_brain(home, registry, "workflow", "delete", "delivery").returncode, 0)
+            self.assertEqual(self.run_brain(home, registry, "project", "delete", "sample", "--cascade").returncode, 0)
+            self.assertEqual(self.run_brain(home, registry, "domain", "delete", "work.studio").returncode, 0)
 
 
 if __name__ == "__main__":

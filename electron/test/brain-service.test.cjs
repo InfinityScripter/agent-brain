@@ -84,13 +84,91 @@ root = pathlib.Path(__file__).parent
   assert.deepEqual(await service.addProject('/tmp/sample-project', {
     name: 'Sample',
     domain: 'personal.software',
-    description: 'Example'
+    description: 'Example',
+    kind: 'product'
   }), inventory);
   const args = JSON.parse(await fs.readFile(path.join(root, 'args.json'), 'utf8'));
-  assert.deepEqual(args.slice(-9), [
+  assert.deepEqual(args.slice(-11), [
     'project', 'add', '/tmp/sample-project', '--domain', 'personal.software',
-    '--name', 'Sample', '--description', 'Example'
+    '--name', 'Sample', '--description', 'Example', '--kind', 'product'
   ]);
+  service.stop();
+});
+
+test('project mutations pass bounded explicit CLI arguments', async (context) => {
+  const root = await temporaryBrain(`
+import json, pathlib, sys
+root = pathlib.Path(__file__).parent
+with (root / 'calls.jsonl').open('a') as handle: handle.write(json.dumps(sys.argv[1:]) + '\\n')
+if 'dependencies' in sys.argv:
+    print(json.dumps({'project': 'sample', 'incoming_relations': [], 'workflows': []}))
+else:
+    (root / 'data' / 'inventory.json').write_text(json.dumps(${JSON.stringify(inventory)}))
+`);
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const service = createBrainService(root);
+  assert.deepEqual(await service.updateProject('sample', {
+    name: 'Sample 2', domain: 'work', description: '', kind: 'product'
+  }), inventory);
+  assert.deepEqual(await service.projectDependencies('sample'), {
+    project: 'sample', incoming_relations: [], workflows: []
+  });
+  assert.deepEqual(await service.deleteProject('sample', { cascade: true }), inventory);
+  const calls = (await fs.readFile(path.join(root, 'calls.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.deepEqual(calls[0].slice(-11), [
+    'project', 'update', 'sample', '--name', 'Sample 2', '--domain', 'work',
+    '--description', '', '--kind', 'product'
+  ]);
+  assert.deepEqual(calls[1].slice(-4), ['project', 'dependencies', 'sample', '--json']);
+  assert.deepEqual(calls[2].slice(-4), ['project', 'delete', 'sample', '--cascade']);
+  await assert.rejects(service.updateProject('sample', {}), /At least one/);
+  service.stop();
+});
+
+test('workflow, domain, and skill mutations use explicit bounded arguments', async (context) => {
+  const root = await temporaryBrain(`
+import json, pathlib, sys
+root = pathlib.Path(__file__).parent
+with (root / 'calls.jsonl').open('a') as handle: handle.write(json.dumps(sys.argv[1:]) + '\\n')
+if 'dependencies' in sys.argv:
+    print(json.dumps({'domain': 'research', 'children': [], 'projects': [], 'workflows': [], 'config_references': []}))
+else:
+    (root / 'data' / 'inventory.json').write_text(json.dumps(${JSON.stringify(inventory)}))
+`);
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const service = createBrainService(root);
+  assert.deepEqual(await service.saveWorkflow({
+    id: 'review', name: 'Review', domain: 'work', project: 'sample',
+    description: '', steps: ['global.review']
+  }), inventory);
+  assert.deepEqual(await service.deleteWorkflow('review'), inventory);
+  assert.deepEqual(await service.saveDomain({
+    id: 'research', name: 'Research', description: '', color: '#123ABC', icon: 'R'
+  }), inventory);
+  assert.deepEqual(await service.domainDependencies('research'), {
+    domain: 'research', children: [], projects: [], workflows: [], config_references: []
+  });
+  assert.deepEqual(await service.deleteDomain('research'), inventory);
+  assert.deepEqual(await service.updateSkillScope({
+    id: 'project.sample.review', level: 'project', project: 'sample'
+  }), inventory);
+  const calls = (await fs.readFile(path.join(root, 'calls.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.deepEqual(calls[0].slice(-13), [
+    'workflow', 'save', 'review', '--name', 'Review', '--domain', 'work',
+    '--description', '', '--steps-json', '["global.review"]', '--project', 'sample'
+  ]);
+  assert.deepEqual(calls[1].slice(-3), ['workflow', 'delete', 'review']);
+  assert.deepEqual(calls[2].slice(-11), [
+    'domain', 'save', 'research', '--name', 'Research', '--description', '',
+    '--color', '#123ABC', '--icon', 'R'
+  ]);
+  assert.deepEqual(calls[3].slice(-3), ['domain', 'dependencies', 'research']);
+  assert.deepEqual(calls[4].slice(-3), ['domain', 'delete', 'research']);
+  assert.deepEqual(calls[5].slice(-7), [
+    'skill', 'scope', 'project.sample.review', '--level', 'project', '--project', 'sample'
+  ]);
+  await assert.rejects(service.saveWorkflow({ id: 'bad', name: 'Bad', domain: 'work', description: 'x'.repeat(513) }), /description/);
+  await assert.rejects(service.saveDomain({ id: 'bad', name: 'Bad', description: 42 }), /description/);
   service.stop();
 });
 

@@ -1,7 +1,7 @@
 {
   "name": "agent-brain-desktop",
   "productName": "Agent Brain",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Local-first context control plane for AI-agent skills, projects, and worktrees.",
   "main": "electron/main.cjs",
   "author": "InfinityScripter",
@@ -18,6 +18,8 @@
   "scripts": {
     "start": "electron-forge start",
     "test": "node --test electron/test/*.test.cjs",
+    "test:visual": "playwright test --config=playwright.config.cjs",
+    "test:visual:update": "playwright test --config=playwright.config.cjs --update-snapshots=all",
     "test:python": "python3 -m unittest discover -s tests -v",
     "test:public": "node scripts/public-release-check.cjs",
     "test:package": "node electron/package-smoke.cjs",
@@ -32,6 +34,7 @@
     "@electron-forge/maker-dmg": "7.11.2",
     "@electron-forge/plugin-fuses": "7.11.2",
     "@electron/fuses": "1.8.0",
+    "@playwright/test": "1.62.0",
     "electron": "43.4.0"
   }
 }

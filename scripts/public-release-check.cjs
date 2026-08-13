@@ -36,7 +36,8 @@ function walk(entry) {
 }
 
 for (const entry of publicEntries) assert.ok(fs.existsSync(path.join(root, entry)), `Missing public entry: ${entry}`);
-const gitAvailable = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: root }).status === 0;
+const gitProbe = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: root, encoding: 'utf8' });
+const gitAvailable = gitProbe.status === 0 && path.resolve(gitProbe.stdout.trim()) === root;
 if (gitAvailable) {
   for (const entry of privateRoots) {
     const probe = path.join(entry, '.agent-brain-ignore-check');

@@ -178,10 +178,124 @@ function createBrainService(brainRoot, options = {}) {
     const args = ['project', 'add', safePath, '--domain', domain];
     if (options.name) args.push('--name', assertString(options.name, 'project name', 128));
     if (options.description) args.push('--description', assertString(options.description, 'description', 512));
+    if (options.kind) args.push('--kind', assertString(options.kind, 'project kind', 128));
     return serializeMutation(async () => {
       await runBrain(args);
       return parseInventory();
     });
+  }
+
+  async function updateProject(projectId, options = {}) {
+    const safeId = assertString(projectId, 'project id', 128);
+    const args = ['project', 'update', safeId];
+    if (options.name !== undefined) args.push('--name', assertString(options.name, 'project name', 128));
+    if (options.domain !== undefined) args.push('--domain', assertString(options.domain, 'domain', 128));
+    if (options.description !== undefined) {
+      if (typeof options.description !== 'string' || options.description.length > 512) {
+        throw new TypeError('description must be a string shorter than 512 characters');
+      }
+      args.push('--description', options.description);
+    }
+    if (options.kind !== undefined) args.push('--kind', assertString(options.kind, 'project kind', 128));
+    if (options.relatedProjects !== undefined) {
+      if (!Array.isArray(options.relatedProjects)) throw new TypeError('related projects must be an array');
+      const value = JSON.stringify(options.relatedProjects);
+      if (value.length > 65_536) throw new TypeError('related projects are too large');
+      args.push('--relations-json', value);
+    }
+    if (options.workspaceRules !== undefined) {
+      if (!Array.isArray(options.workspaceRules)) throw new TypeError('workspace rules must be an array');
+      const value = JSON.stringify(options.workspaceRules);
+      if (value.length > 65_536) throw new TypeError('workspace rules are too large');
+      args.push('--workspace-rules-json', value);
+    }
+    if (args.length === 3) throw new TypeError('At least one project field must be updated');
+    return serializeMutation(async () => {
+      await runBrain(args);
+      return parseInventory();
+    });
+  }
+
+  async function projectDependencies(projectId) {
+    const safeId = assertString(projectId, 'project id', 128);
+    const { stdout } = await runBrain(['project', 'dependencies', safeId, '--json']);
+    return JSON.parse(stdout);
+  }
+
+  async function deleteProject(projectId, options = {}) {
+    const safeId = assertString(projectId, 'project id', 128);
+    const args = ['project', 'delete', safeId];
+    if (options.cascade === true) args.push('--cascade');
+    return serializeMutation(async () => {
+      await runBrain(args);
+      return parseInventory();
+    });
+  }
+
+  async function saveWorkflow(payload = {}) {
+    const id = assertString(payload.id, 'workflow id', 128);
+    const description = payload.description ?? '';
+    if (typeof description !== 'string' || description.length > 512) {
+      throw new TypeError('workflow description must be a string no longer than 512 characters');
+    }
+    const steps = Array.isArray(payload.steps) ? payload.steps : [];
+    const stepsJson = JSON.stringify(steps);
+    if (stepsJson.length > 64 * 1024) throw new TypeError('workflow steps are too large');
+    const args = [
+      'workflow', 'save', id,
+      '--name', assertString(payload.name, 'workflow name', 128),
+      '--domain', assertString(payload.domain, 'workflow domain', 128),
+      '--description', description,
+      '--steps-json', stepsJson
+    ];
+    if (payload.project) args.push('--project', assertString(payload.project, 'workflow project', 128));
+    if (payload.force === true) args.push('--force');
+    return serializeMutation(async () => { await runBrain(args); return parseInventory(); });
+  }
+
+  async function deleteWorkflow(workflowId) {
+    const id = assertString(workflowId, 'workflow id', 128);
+    return serializeMutation(async () => { await runBrain(['workflow', 'delete', id]); return parseInventory(); });
+  }
+
+  async function saveDomain(payload = {}) {
+    const id = assertString(payload.id, 'domain id', 128);
+    const description = payload.description ?? '';
+    if (typeof description !== 'string' || description.length > 512) {
+      throw new TypeError('domain description must be a string no longer than 512 characters');
+    }
+    const args = [
+      'domain', 'save', id,
+      '--name', assertString(payload.name, 'domain name', 128),
+      '--description', description,
+      '--color', assertString(payload.color || '#4AA8FF', 'domain color', 32),
+      '--icon', assertString(payload.icon || 'circle', 'domain icon', 64)
+    ];
+    if (payload.parent) args.push('--parent', assertString(payload.parent, 'parent domain', 128));
+    if (payload.force === true) args.push('--force');
+    return serializeMutation(async () => { await runBrain(args); return parseInventory(); });
+  }
+
+  async function domainDependencies(domainId) {
+    const id = assertString(domainId, 'domain id', 128);
+    const { stdout } = await runBrain(['domain', 'dependencies', id]);
+    return JSON.parse(stdout);
+  }
+
+  async function deleteDomain(domainId) {
+    const id = assertString(domainId, 'domain id', 128);
+    return serializeMutation(async () => { await runBrain(['domain', 'delete', id]); return parseInventory(); });
+  }
+
+  async function updateSkillScope(payload = {}) {
+    const args = [
+      'skill', 'scope', assertString(payload.id, 'skill id', 256),
+      '--level', assertString(payload.level, 'scope level', 32)
+    ];
+    if (payload.domain) args.push('--domain', assertString(payload.domain, 'scope domain', 128));
+    if (payload.project) args.push('--project', assertString(payload.project, 'scope project', 128));
+    if (payload.plugin) args.push('--plugin', assertString(payload.plugin, 'plugin id', 128));
+    return serializeMutation(async () => { await runBrain(args); return parseInventory(); });
   }
 
   function stop() {
@@ -191,7 +305,11 @@ function createBrainService(brainRoot, options = {}) {
     activeChildren.clear();
   }
 
-  return { root, readInventory, refresh, simulate, validate, explain, addProject, stop, isWithin };
+  return {
+    root, readInventory, refresh, simulate, validate, explain, addProject,
+    updateProject, projectDependencies, deleteProject, saveWorkflow, deleteWorkflow,
+    saveDomain, domainDependencies, deleteDomain, updateSkillScope, stop, isWithin
+  };
 }
 
 module.exports = { createBrainService, assertString, isWithin };

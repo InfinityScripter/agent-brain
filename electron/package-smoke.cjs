@@ -29,8 +29,13 @@ for (const forbidden of [
   '/workflows/',
   '/brain.py',
   '/out/',
+  '/node_modules/@playwright',
+  '/node_modules/playwright',
+  '/node_modules/playwright-core',
   '/Open Agent Brain.command',
-  '/electron/test/'
+  '/playwright.config.cjs',
+  '/electron/test',
+  '/electron/visual'
 ]) {
   assert.equal(files.some((file) => file === forbidden || file.startsWith(forbidden)), false, `Forbidden packaged path: ${forbidden}`);
 }

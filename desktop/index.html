@@ -54,7 +54,7 @@
           <div class="metric-grid" id="metricGrid"></div>
           <div class="section-heading">
             <div><p class="eyebrow">DOMAIN MAP</p><h2>Contexts and projects</h2></div>
-            <p>Choose a domain to inspect its projects and real relationships.</p>
+            <div class="section-heading-actions"><p>Choose a domain to inspect or edit its context.</p><button id="addDomainButton" class="small-action">+ Add domain</button></div>
           </div>
           <div class="domain-grid" id="domainGrid"></div>
           <div class="two-column">
@@ -63,7 +63,7 @@
               <div id="coverageList" class="coverage-list"></div>
             </section>
             <section class="panel">
-              <div class="panel-head"><div><p class="eyebrow">WORKFLOWS</p><h3>Operational flows</h3></div><span id="workflowCount" class="muted-chip">—</span></div>
+              <div class="panel-head"><div><p class="eyebrow">WORKFLOWS</p><h3>Operational flows</h3></div><div class="panel-actions"><span id="workflowCount" class="muted-chip">—</span><button id="addWorkflowButton" class="small-action">+ Add</button></div></div>
               <div id="workflowList" class="workflow-list"></div>
             </section>
           </div>
@@ -73,10 +73,6 @@
           <div class="toolbar">
             <div class="segmented" id="projectFilters">
               <button class="active" data-filter="all">All</button>
-              <button data-filter="work">Work</button>
-              <button data-filter="personal">Personal</button>
-              <button data-filter="creative">Creative</button>
-              <button data-filter="meta">Meta</button>
             </div>
             <div class="toolbar-actions"><span class="toolbar-count" id="projectCount">—</span><button id="addProjectButton" class="primary compact">Add project</button></div>
           </div>
@@ -92,7 +88,18 @@
             <label><span>Context</span><select id="graphDomain"></select></label>
           </div>
           <aside class="skill-inspector" id="skillInspector" hidden></aside>
-          <div class="graph-canvas" id="graphCanvas"><svg id="graphEdges" aria-hidden="true"></svg><div id="graphNodes"></div><ul id="graphRelations" class="sr-only" aria-label="Graph relationships"></ul></div>
+          <div class="graph-canvas" id="graphCanvas">
+            <div class="graph-world" id="graphWorld"><svg id="graphEdges" aria-hidden="true"></svg><div id="graphNodes"></div></div>
+            <div class="graph-controls" role="toolbar" aria-label="Graph view controls">
+              <button id="graphZoomOut" title="Zoom out" aria-label="Zoom out">−</button>
+              <span id="graphZoomLevel" aria-live="polite">100%</span>
+              <button id="graphZoomIn" title="Zoom in" aria-label="Zoom in">+</button>
+              <button id="graphZoomFit" title="Fit view" aria-label="Fit view">⛶</button>
+              <button id="graphZoomReset" title="Reset view" aria-label="Reset view">1:1</button>
+            </div>
+            <div class="edge-toolbar" id="edgeToolbar" hidden><span id="edgeToolbarLabel"></span><button id="edgeDeleteButton">Delete connection</button></div>
+            <ul id="graphRelations" class="sr-only" aria-label="Graph relationships"></ul>
+          </div>
         </section>
 
         <section class="view" id="view-simulator">
@@ -127,13 +134,93 @@
     </div>
     <dialog id="projectDialog" class="project-dialog">
       <form id="projectForm">
-        <div class="dialog-head"><div><p class="eyebrow">PROJECT REGISTRY</p><h2>Add a project</h2></div><button type="button" id="closeProjectDialog" class="icon-button" aria-label="Close">×</button></div>
-        <p>Agent Brain will detect AGENTS.md, CLAUDE.md, and local skill folders automatically.</p>
+        <div class="dialog-head"><div><p class="eyebrow">PROJECT REGISTRY</p><h2 id="projectDialogTitle">Add a project</h2></div><button type="button" id="closeProjectDialog" class="icon-button" aria-label="Close">×</button></div>
+        <p id="projectDialogCopy">Agent Brain will detect AGENTS.md, CLAUDE.md, and local skill folders automatically.</p>
+        <input id="projectId" name="id" type="hidden">
         <label>Folder<input id="projectPath" name="path" readonly required></label>
-        <label>Name<input id="projectName" name="name" maxlength="128" placeholder="Optional display name"></label>
+        <label>Name<input id="projectName" name="name" maxlength="128" placeholder="Display name" required></label>
         <label>Domain<select id="projectDomain" name="domain" required></select></label>
+        <label>Kind<input id="projectKind" name="kind" maxlength="128" placeholder="software-project" required></label>
         <label>Description<textarea id="projectDescription" name="description" maxlength="512" placeholder="Optional context for agents"></textarea></label>
-        <div class="dialog-actions"><button type="button" id="cancelProjectDialog">Cancel</button><button type="submit" class="primary">Add project</button></div>
+        <section id="projectAdvancedFields" class="form-section" hidden>
+          <div class="form-section-head"><div><p class="eyebrow">RELATIONSHIPS</p><h3>Related projects</h3></div><button type="button" id="addProjectRelation">+ Add</button></div>
+          <div id="projectRelationRows" class="form-rows"></div>
+        </section>
+        <section id="projectWorkspaceFields" class="form-section" hidden>
+          <div class="form-section-head"><div><p class="eyebrow">WORKSPACES</p><h3>Worktree rules</h3></div><button type="button" id="addWorkspaceRule">+ Add</button></div>
+          <div id="workspaceRuleRows" class="form-rows"></div>
+        </section>
+        <div class="dialog-actions"><button type="button" id="cancelProjectDialog">Cancel</button><button type="submit" id="saveProjectButton" class="primary">Add project</button></div>
+      </form>
+    </dialog>
+    <dialog id="deleteProjectDialog" class="project-dialog danger-dialog">
+      <form id="deleteProjectForm">
+        <div class="dialog-head"><div><p class="eyebrow">REMOVE FROM REGISTRY</p><h2 id="deleteProjectTitle">Delete project?</h2></div><button type="button" id="closeDeleteProjectDialog" class="icon-button" aria-label="Close">×</button></div>
+        <p id="deleteProjectCopy"></p>
+        <div id="deleteProjectDependencies" class="dependency-summary"></div>
+        <p class="safety-note">The external project folder, instructions, and skills will not be deleted.</p>
+        <div class="dialog-actions"><button type="button" id="cancelDeleteProject">Cancel</button><button type="submit" id="confirmDeleteProject" class="danger-button">Remove from registry</button></div>
+      </form>
+    </dialog>
+    <dialog id="workflowDialog" class="project-dialog">
+      <form id="workflowForm">
+        <div class="dialog-head"><div><p class="eyebrow">OPERATIONAL FLOW</p><h2 id="workflowDialogTitle">Add workflow</h2></div><button type="button" id="closeWorkflowDialog" class="icon-button" aria-label="Close">×</button></div>
+        <input id="workflowOriginalId" type="hidden">
+        <label>ID<input id="workflowId" maxlength="128" required placeholder="release-readiness"></label>
+        <label>Name<input id="workflowName" maxlength="128" required placeholder="Release readiness"></label>
+        <label>Domain<select id="workflowDomain" required></select></label>
+        <label>Project<select id="workflowProject"><option value="">Domain-level workflow</option></select></label>
+        <label>Description<textarea id="workflowDescription" maxlength="512"></textarea></label>
+        <section class="form-section">
+          <div class="form-section-head"><div><p class="eyebrow">STEPS</p><h3>Ordered skills</h3></div><button type="button" id="addWorkflowStep">+ Add step</button></div>
+          <div id="workflowStepRows" class="form-rows"></div>
+        </section>
+        <div class="dialog-actions"><button type="button" id="deleteWorkflowButton" class="danger-button" hidden>Delete workflow</button><span class="dialog-spacer"></span><button type="button" id="cancelWorkflowDialog">Cancel</button><button type="submit" class="primary">Save workflow</button></div>
+      </form>
+    </dialog>
+    <dialog id="domainDialog" class="project-dialog">
+      <form id="domainForm">
+        <div class="dialog-head"><div><p class="eyebrow">CONTEXT DOMAIN</p><h2 id="domainDialogTitle">Add domain</h2></div><button type="button" id="closeDomainDialog" class="icon-button" aria-label="Close">×</button></div>
+        <input id="domainOriginalId" type="hidden">
+        <label>ID<input id="domainId" maxlength="128" required placeholder="work.company"></label>
+        <label>Name<input id="domainName" maxlength="128" required placeholder="Work · Company"></label>
+        <label>Parent<select id="domainParent"><option value="">Root domain</option></select></label>
+        <div class="inline-fields"><label>Color<input id="domainColor" type="color" value="#4aa8ff"></label><label>Icon<input id="domainIcon" maxlength="64" value="circle"></label></div>
+        <label>Description<textarea id="domainDescription" maxlength="512"></textarea></label>
+        <div id="domainDependencies" class="dependency-summary"></div>
+        <div class="dialog-actions"><button type="button" id="deleteDomainButton" class="danger-button" hidden>Delete domain</button><span class="dialog-spacer"></span><button type="button" id="cancelDomainDialog">Cancel</button><button type="submit" class="primary">Save domain</button></div>
+      </form>
+    </dialog>
+    <dialog id="skillScopeDialog" class="project-dialog">
+      <form id="skillScopeForm">
+        <div class="dialog-head"><div><p class="eyebrow">CAPABILITY OWNERSHIP</p><h2 id="skillScopeTitle">Change skill scope</h2></div><button type="button" id="closeSkillScopeDialog" class="icon-button" aria-label="Close">×</button></div>
+        <input id="skillScopeId" type="hidden">
+        <p id="skillScopeCopy"></p>
+        <label>Scope<select id="skillScopeLevel"><option value="auto">Automatic</option><option value="global">Global</option><option value="domain">Domain</option><option value="project">Project</option><option value="plugin">Plugin</option><option value="archive">Archive</option></select></label>
+        <label id="skillScopeDomainField" hidden>Domain<select id="skillScopeDomain"></select></label>
+        <label id="skillScopeProjectField" hidden>Project<select id="skillScopeProject"></select></label>
+        <label id="skillScopePluginField" hidden>Plugin ID<input id="skillScopePlugin" maxlength="128"></label>
+        <p class="safety-note">Automatic removes only the GUI-managed override and restores source-based ownership.</p>
+        <div class="dialog-actions"><button type="button" id="cancelSkillScopeDialog">Cancel</button><button type="submit" class="primary">Save scope</button></div>
+      </form>
+    </dialog>
+    <dialog id="graphRelationDialog" class="project-dialog">
+      <form id="graphRelationForm">
+        <div class="dialog-head"><div><p class="eyebrow">GRAPH CONNECTION</p><h2 id="graphRelationTitle">Create project link</h2></div><button type="button" id="closeGraphRelationDialog" class="icon-button" aria-label="Close">×</button></div>
+        <input id="graphRelationMode" type="hidden">
+        <input id="graphRelationSource" type="hidden"><input id="graphRelationTarget" type="hidden">
+        <div id="graphRelationPreview" class="connection-preview"></div>
+        <label id="graphRelationTypeField">Relationship type<input id="graphRelationType" maxlength="64" required value="uses" placeholder="uses"></label>
+        <p id="graphRelationCopy">The connection is directional: source → target. You can edit or remove it later in the source project.</p>
+        <div class="dialog-actions"><button type="button" id="cancelGraphRelation">Cancel</button><button type="submit" id="saveGraphRelation" class="primary">Create connection</button></div>
+      </form>
+    </dialog>
+    <dialog id="deleteEntityDialog" class="project-dialog compact-dialog">
+      <form id="deleteEntityForm">
+        <div class="dialog-head"><div><p class="eyebrow">DELETE FROM REGISTRY</p><h2 id="deleteEntityTitle">Delete item?</h2></div><button type="button" id="closeDeleteEntityDialog" class="icon-button" aria-label="Close">×</button></div>
+        <p id="deleteEntityCopy">This action changes only the Agent Brain registry.</p>
+        <p class="safety-note">Project folders and skill source files are never deleted by this action.</p>
+        <div class="dialog-actions"><button type="button" id="cancelDeleteEntity">Cancel</button><button type="submit" id="confirmDeleteEntity" class="danger-button">Delete</button></div>
       </form>
     </dialog>
     <script src="renderer.js"></script>

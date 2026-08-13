@@ -31,6 +31,8 @@ function projectInstructions(id) { return state.inventory.instructions.filter((i
 function projectWorkflows(id) { return state.inventory.workflows.filter((workflow) => workflow.project === id); }
 function projectsForRoot(root) { return state.inventory.projects.filter((project) => rootDomain(project.domain) === root); }
 function domainsForRoot(root) { return state.inventory.domains.filter((domain) => rootDomain(domain.id) === root); }
+function domainColor(domainId) { const root = rootDomain(domainId); return colors[root] || domainById(root)?.color || domainById(domainId)?.color || '#4aa8ff'; }
+function domainIcon(domain) { return icons[rootDomain(domain.id)] || String(domain.icon || domain.name || '?').slice(0, 1).toUpperCase(); }
 
 function showNotice(message, error = false) {
   const notice = $('#notice');
@@ -105,20 +107,25 @@ function renderDomains() {
     const root = rootDomain(domain.id);
     const projects = projectsForRoot(root);
     const skills = state.inventory.skills.filter((skill) => skill.scope.domain && rootDomain(skill.scope.domain) === root);
-    const card = element('button', 'domain-card');
-    card.style.setProperty('--accent', colors[root]);
-    const icon = element('span', 'domain-icon', icons[root]);
+    const card = element('article', 'domain-card');
+    card.style.setProperty('--accent', domainColor(domain.id));
+    const icon = element('span', 'domain-icon', domainIcon(domain));
     const title = element('h3', '', domain.name);
     const description = element('p', '', domain.description);
     const footer = element('footer');
     footer.append(element('span', '', `${projects.length} projects`), element('span', '', `${skills.length} domain skills`));
-    card.append(icon, title, description, footer);
-    card.addEventListener('click', () => {
+    const actions = element('span', 'domain-card-actions'); const edit = element('button', '', '···'); edit.type = 'button'; edit.setAttribute('aria-label', `Edit ${domain.name}`); actions.append(edit);
+    edit.addEventListener('click', () => openDomainDialog(domain));
+    const main = element('button', 'domain-card-main'); main.append(icon, title, description, footer);
+    main.addEventListener('click', () => {
       state.projectFilter = root;
       syncFilterButtons('#projectFilters', root);
       renderProjects();
       setView('projects');
     });
+    card.append(actions, main);
+    const children = state.inventory.domains.filter((item) => item.parent === domain.id);
+    if (children.length) { const childList = element('div', 'domain-children'); for (const child of children) { const button = element('button', 'domain-child', child.name); button.addEventListener('click', () => openDomainDialog(child)); childList.append(button); } card.append(childList); }
     grid.append(card);
   }
   if (!top.length) grid.append(element('div', 'empty-state', 'No domains have been described yet.'));
@@ -148,8 +155,9 @@ function renderWorkflows() {
   $('#workflowCount').textContent = `${state.inventory.workflows.length} flows`;
   const list = $('#workflowList'); clear(list);
   for (const workflow of state.inventory.workflows) {
-    const item = element('article', 'workflow-item');
+    const item = element('button', 'workflow-item');
     item.append(element('strong', '', workflow.name), element('span', '', workflow.steps.join(' → '))); list.append(item);
+    item.addEventListener('click', () => openWorkflowDialog(workflow));
   }
   if (!state.inventory.workflows.length) list.append(element('div', 'empty-state', 'No workflows have been described yet.'));
 }
@@ -162,13 +170,28 @@ function syncFilterButtons(selector, value) {
   });
 }
 
+function renderProjectFilters() {
+  const filters = $('#projectFilters');
+  clear(filters);
+  const roots = state.inventory.domains.filter((domain) => !domain.parent);
+  for (const [id, label] of [['all', 'All'], ...roots.map((domain) => [domain.id, domain.name])]) {
+    const button = element('button', '', label);
+    button.dataset.filter = id;
+    filters.append(button);
+  }
+  if (state.projectFilter !== 'all' && !roots.some((domain) => domain.id === state.projectFilter)) {
+    state.projectFilter = 'all';
+  }
+  syncFilterButtons('#projectFilters', state.projectFilter);
+}
+
 function renderProjects() {
   const filtered = state.inventory.projects.filter((project) => state.projectFilter === 'all' || rootDomain(project.domain) === state.projectFilter);
   $('#projectCount').textContent = `${filtered.length} projects`;
   const list = $('#projectList'); clear(list);
   for (const project of filtered) {
     const row = element('button', 'project-row');
-    row.style.setProperty('--accent', colors[rootDomain(project.domain)]);
+    row.style.setProperty('--accent', domainColor(project.domain));
     row.classList.toggle('active', state.selectedProject === project.id);
     const body = element('span'); body.append(element('strong', '', project.name), element('small', '', project.path));
     const dots = element('span', 'coverage-dots');
@@ -194,10 +217,13 @@ function renderProjectDetail(project) {
   const detail = $('#projectDetail'); clear(detail);
   const header = element('header', 'project-detail-header');
   const copy = element('div'); copy.append(element('p', 'eyebrow', `${project.domain} · ${project.kind || 'project'}`), element('h2', '', project.name), element('p', '', project.description || 'No description has been added yet.'));
-  const reveal = element('button', 'reveal-button', '↗'); reveal.title = 'Reveal in Finder'; reveal.addEventListener('click', async () => {
+  const actions = element('div', 'project-detail-actions');
+  const edit = element('button', '', 'Edit'); edit.addEventListener('click', () => openProjectEditor(project));
+  const remove = element('button', 'delete-project', 'Delete'); remove.addEventListener('click', () => openDeleteProjectDialog(project));
+  const reveal = element('button', 'reveal-button', '↗'); reveal.title = 'Reveal in Finder'; reveal.setAttribute('aria-label', 'Reveal project in Finder'); reveal.addEventListener('click', async () => {
     try { await window.agentBrain.revealPath(project.path); } catch (error) { showNotice(error.message, true); }
   });
-  header.append(copy, reveal); detail.append(header, element('div', 'path-line', project.path));
+  actions.append(edit, remove, reveal); header.append(copy, actions); detail.append(header, element('div', 'path-line', project.path));
 
   const c = project.coverage;
   const metrics = element('div', 'detail-metrics');
@@ -228,6 +254,180 @@ function detailSection(title, items) {
   section.append(tags); return section;
 }
 
+const graphView = { pan: { x: 24, y: 24 }, zoom: 1, userAdjusted: false, positions: loadGraphPositions(), nodeIndex: new Map(), links: [], selectedEdge: null, inspected: null };
+
+function loadGraphPositions() { try { return new Map(Object.entries(JSON.parse(localStorage.getItem('agentBrain.graphPositions') || '{}'))); } catch { return new Map(); } }
+function saveGraphPositions() { try { localStorage.setItem('agentBrain.graphPositions', JSON.stringify(Object.fromEntries(graphView.positions))); } catch { /* positions are a view preference; losing them is acceptable */ } }
+
+function applyGraphTransform() {
+  $('#graphWorld').style.transform = `translate(${graphView.pan.x}px, ${graphView.pan.y}px) scale(${graphView.zoom})`;
+  $('#graphZoomLevel').textContent = `${Math.round(graphView.zoom * 100)}%`;
+  positionEdgeToolbar();
+}
+
+function clientToWorld(event) {
+  const rect = $('#graphCanvas').getBoundingClientRect();
+  return { x: (event.clientX - rect.left - graphView.pan.x) / graphView.zoom, y: (event.clientY - rect.top - graphView.pan.y) / graphView.zoom };
+}
+
+function setGraphZoom(zoom, centerX, centerY) {
+  const rect = $('#graphCanvas').getBoundingClientRect();
+  const cx = centerX ?? rect.width / 2; const cy = centerY ?? rect.height / 2;
+  const next = Math.min(2.5, Math.max(.2, zoom));
+  graphView.pan.x = cx - (cx - graphView.pan.x) * (next / graphView.zoom);
+  graphView.pan.y = cy - (cy - graphView.pan.y) * (next / graphView.zoom);
+  graphView.zoom = next;
+  applyGraphTransform();
+}
+
+function fitGraphView() {
+  const items = [...graphView.nodeIndex.values()]; if (!items.length) return;
+  const rect = $('#graphCanvas').getBoundingClientRect();
+  const minX = Math.min(...items.map((item) => item.x)); const minY = Math.min(...items.map((item) => item.y));
+  const maxX = Math.max(...items.map((item) => item.x + item.w)); const maxY = Math.max(...items.map((item) => item.y + item.h));
+  const zoom = Math.min(2.5, Math.max(.2, Math.min((rect.width - 80) / Math.max(1, maxX - minX), (rect.height - 80) / Math.max(1, maxY - minY), 1)));
+  graphView.zoom = zoom;
+  graphView.pan.x = (rect.width - (maxX - minX) * zoom) / 2 - minX * zoom;
+  graphView.pan.y = (rect.height - (maxY - minY) * zoom) / 2 - minY * zoom;
+  applyGraphTransform();
+}
+
+function attachNodePointer(node, id, kind, entity) {
+  node.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || event.target.closest('.port')) return;
+    event.preventDefault(); event.stopPropagation();
+    const item = graphView.nodeIndex.get(id);
+    const start = { x: event.clientX, y: event.clientY }; const origin = { x: item.x, y: item.y }; let moved = false;
+    const onMove = (move) => {
+      if (!moved && Math.hypot(move.clientX - start.x, move.clientY - start.y) < 4) return;
+      moved = true;
+      item.x = origin.x + (move.clientX - start.x) / graphView.zoom;
+      item.y = origin.y + (move.clientY - start.y) / graphView.zoom;
+      node.style.left = `${item.x}px`; node.style.top = `${item.y}px`;
+      drawGraphEdges();
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp);
+      if (moved) { graphView.positions.set(id, { x: Math.round(item.x), y: Math.round(item.y) }); saveGraphPositions(); }
+      else if (kind === 'skill') selectSkill(entity.id);
+      else inspectNode(kind, entity, id);
+    };
+    window.addEventListener('pointermove', onMove); window.addEventListener('pointerup', onUp);
+  });
+  node.tabIndex = 0;
+  node.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    if (kind === 'skill') selectSkill(entity.id); else inspectNode(kind, entity, id);
+  });
+}
+
+function attachPorts(node, id, kind) {
+  if (kind !== 'project' && kind !== 'domain') return;
+  const input = element('span', 'port in'); input.title = 'Connection target'; node.append(input);
+  if (kind !== 'project') return;
+  const output = element('span', 'port out'); output.title = 'Drag to another project or domain';
+  output.addEventListener('pointerdown', (event) => startConnect(event, id, node));
+  node.append(output);
+}
+
+function startConnect(event, sourceId, sourceNode) {
+  if (event.button !== 0) return;
+  event.preventDefault(); event.stopPropagation();
+  const live = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  live.classList.add('live'); $('#graphEdges').append(live);
+  sourceNode.classList.add('connecting');
+  const source = graphView.nodeIndex.get(sourceId);
+  const sourceRaw = sourceId.slice(sourceId.indexOf(':') + 1);
+  let target = null;
+  const validTarget = (el) => {
+    const hit = el?.closest?.('.graph-node'); if (!hit) return null;
+    const id = hit.dataset.nodeId || ''; const item = graphView.nodeIndex.get(id); if (!item) return null;
+    if (item.kind === 'project' && id !== sourceId) return { hit, id, kind: 'project' };
+    if (item.kind === 'domain' && projectById(sourceRaw)?.domain !== item.entity.id) return { hit, id, kind: 'domain' };
+    return null;
+  };
+  const onMove = (move) => {
+    const point = clientToWorld(move);
+    const x1 = source.x + source.w; const y1 = source.y + source.h / 2; const bend = Math.max(30, (point.x - x1) * .45);
+    live.setAttribute('d', `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${point.x - bend} ${point.y}, ${point.x} ${point.y}`);
+    const next = validTarget(document.elementFromPoint(move.clientX, move.clientY));
+    if (target && target.hit !== next?.hit) target.hit.classList.remove('drop-target');
+    if (next) next.hit.classList.add('drop-target');
+    target = next;
+  };
+  const onUp = () => {
+    window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp);
+    live.remove(); sourceNode.classList.remove('connecting');
+    if (!target) return;
+    target.hit.classList.remove('drop-target');
+    const targetRaw = target.id.slice(target.id.indexOf(':') + 1);
+    if (target.kind === 'project') openGraphRelationDialog(sourceRaw, targetRaw);
+    else openGraphMoveDialog(sourceRaw, targetRaw);
+  };
+  window.addEventListener('pointermove', onMove); window.addEventListener('pointerup', onUp);
+}
+
+function drawGraphEdges() {
+  const edges = $('#graphEdges'); clear(edges); const relationText = $('#graphRelations'); clear(relationText);
+  for (const [from, to, showVisual = true, label = ''] of graphView.links) {
+    const a = graphView.nodeIndex.get(from); const b = graphView.nodeIndex.get(to); if (!a || !b) continue;
+    relationText.append(element('li', '', `${from} → ${to}`));
+    if (!showVisual) continue;
+    const x1 = a.x + a.w; const y1 = a.y + a.h / 2; const x2 = b.x; const y2 = b.y + b.h / 2; const bend = Math.max(30, (x2 - x1) * .45);
+    const d = `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`;
+    const pathNode = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    pathNode.setAttribute('d', d);
+    edges.append(pathNode);
+    if (label && from.startsWith('project:') && to.startsWith('project:')) {
+      const key = `${from}|${to}|${label}`;
+      pathNode.classList.add('relation-edge');
+      pathNode.classList.toggle('selected', graphView.selectedEdge?.key === key);
+      const hit = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      hit.setAttribute('d', d); hit.classList.add('edge-hit'); hit.dataset.key = key;
+      hit.addEventListener('pointerdown', (event) => { event.stopPropagation(); selectEdge(key, from, to, label); });
+      edges.append(hit);
+    }
+    if (label) {
+      const textNode = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      textNode.setAttribute('x', String((x1 + x2) / 2)); textNode.setAttribute('y', String((y1 + y2) / 2 - 7)); textNode.setAttribute('text-anchor', 'middle'); textNode.textContent = label; edges.append(textNode);
+    }
+  }
+  positionEdgeToolbar();
+}
+
+function selectEdge(key, source, target, type) {
+  graphView.selectedEdge = { key, source, target, type };
+  drawGraphEdges();
+}
+
+function clearEdgeSelection() {
+  if (!graphView.selectedEdge) return;
+  graphView.selectedEdge = null;
+  drawGraphEdges();
+}
+
+function positionEdgeToolbar() {
+  const toolbar = $('#edgeToolbar'); const selection = graphView.selectedEdge;
+  if (!selection) { toolbar.hidden = true; return; }
+  const a = graphView.nodeIndex.get(selection.source); const b = graphView.nodeIndex.get(selection.target);
+  if (!a || !b) { toolbar.hidden = true; return; }
+  const mx = (a.x + a.w + b.x) / 2; const my = (a.y + a.h / 2 + b.y + b.h / 2) / 2;
+  toolbar.style.left = `${graphView.pan.x + mx * graphView.zoom}px`;
+  toolbar.style.top = `${graphView.pan.y + my * graphView.zoom}px`;
+  $('#edgeToolbarLabel').textContent = `${projectById(selection.source.slice(8))?.name || selection.source} · ${selection.type} · ${projectById(selection.target.slice(8))?.name || selection.target}`;
+  toolbar.hidden = false;
+}
+
+function openDeleteRelationDialog(selection) {
+  const dialog = $('#deleteEntityDialog');
+  dialog.dataset.kind = 'relation'; dialog.dataset.id = selection.source.slice(8);
+  dialog.dataset.target = selection.target.slice(8); dialog.dataset.relationType = selection.type;
+  $('#deleteEntityTitle').textContent = 'Delete connection?';
+  $('#deleteEntityCopy').textContent = `The "${selection.type}" connection from ${projectById(selection.source.slice(8))?.name || ''} to ${projectById(selection.target.slice(8))?.name || ''} will be removed.`;
+  dialog.showModal(); $('#confirmDeleteEntity').focus();
+}
+
 function renderGraph() {
   const selected = $('#graphDomain').value || 'all';
   const domains = selected === 'all' ? state.inventory.domains : domainsForRoot(rootDomain(selected));
@@ -244,29 +444,41 @@ function renderGraph() {
   let skills = allGraphSkills.slice(0, 36);
   const selectedSkill = state.inventory.skills.find((skill) => skill.id === state.selectedSkill);
   if (selectedSkill && !skills.some((skill) => skill.id === selectedSkill.id)) skills = [...skills.slice(0, 35), selectedSkill];
-  const nodes = $('#graphNodes'); clear(nodes); const edges = $('#graphEdges'); clear(edges); const relationText = $('#graphRelations'); clear(relationText);
-  const positions = new Map();
-  const addNode = (id, title, subtitle, x, y, color, kind = '') => {
-    const node = element(kind === 'skill' ? 'button' : 'article', `graph-node ${kind}`.trim()); node.style.left = `${x}px`; node.style.top = `${y}px`; node.style.setProperty('--node-color', color); node.append(element('strong', '', title), element('small', '', subtitle)); nodes.append(node); positions.set(id, { x, y, w: kind === 'skill' ? 245 : 220, h: 68 }); return node;
+  const nodes = $('#graphNodes'); clear(nodes);
+  graphView.nodeIndex = new Map();
+  const saved = graphView.positions;
+  const addNode = (id, title, subtitle, x, y, color, kind = 'core', entity = null) => {
+    const override = saved.get(id); if (override) { x = override.x; y = override.y; }
+    const node = element('article', `graph-node ${kind === 'core' ? '' : kind}`.trim());
+    node.style.left = `${x}px`; node.style.top = `${y}px`; node.style.setProperty('--node-color', color);
+    node.dataset.nodeId = id;
+    node.append(element('strong', '', title), element('small', '', subtitle));
+    nodes.append(node);
+    graphView.nodeIndex.set(id, { x, y, w: kind === 'skill' ? 245 : 220, h: 68, node, kind, entity });
+    attachNodePointer(node, id, kind, entity); attachPorts(node, id, kind);
+    return node;
   };
   addNode('core', 'Global Core', 'safety · precedence · global skills', 32, 35, '#f2eee4');
   const top = domains.filter((domain) => !domain.parent);
-  top.forEach((domain, index) => addNode(`domain:${domain.id}`, domain.name, domain.id, 300, 35 + index * 150, colors[rootDomain(domain.id)]));
+  top.forEach((domain, index) => { const node = addNode(`domain:${domain.id}`, domain.name, domain.id, 300, 35 + index * 150, domainColor(domain.id), 'domain', domain); node.dataset.domainId = domain.id; });
   const children = domains.filter((domain) => domain.parent);
-  children.forEach((domain, index) => addNode(`domain:${domain.id}`, domain.name, domain.id, 565, 35 + index * 135, colors[rootDomain(domain.id)]));
-  projects.forEach((project, index) => addNode(`project:${project.id}`, project.name, `${project.coverage.skill_count} skills · ${project.coverage.related_project_count} links`, 830, 25 + index * 100, colors[rootDomain(project.domain)]));
-  workflows.forEach((workflow, index) => addNode(`flow:${workflow.id}`, workflow.name, `${workflow.steps.length} steps`, 1110, 25 + index * 110, '#e76fae'));
+  children.forEach((domain, index) => { const node = addNode(`domain:${domain.id}`, domain.name, domain.id, 565, 35 + index * 135, domainColor(domain.id), 'domain', domain); node.dataset.domainId = domain.id; });
+  projects.forEach((project, index) => {
+    const node = addNode(`project:${project.id}`, project.name, `${project.coverage.skill_count} skills · ${project.coverage.related_project_count} links`, 830, 25 + index * 100, domainColor(project.domain), 'project', project);
+    node.draggable = true; node.dataset.projectId = project.id;
+    node.addEventListener('dragstart', (event) => { event.dataTransfer.setData('text/plain', project.id); event.dataTransfer.effectAllowed = 'linkMove'; });
+  });
+  workflows.forEach((workflow, index) => addNode(`flow:${workflow.id}`, workflow.name, `${workflow.steps.length} steps`, 1110, 25 + index * 110, '#e76fae', 'flow', workflow));
   skills.forEach((skill, index) => {
-    const node = addNode(`skill:${skill.id}`, skill.name, skill.id, 1400, 25 + index * 84, '#f3b84b', 'skill');
+    const node = addNode(`skill:${skill.id}`, skill.name, skill.id, 1400, 25 + index * 84, '#f3b84b', 'skill', skill);
     node.classList.toggle('selected', skill.id === state.selectedSkill);
-    node.addEventListener('click', () => selectSkill(skill.id));
   });
   const links = [];
   top.forEach((domain) => links.push(['core', `domain:${domain.id}`]));
   children.forEach((domain) => links.push([`domain:${domain.parent}`, `domain:${domain.id}`]));
   projects.forEach((project) => links.push([`domain:${project.domain}`, `project:${project.id}`]));
   workflows.forEach((workflow) => links.push([workflow.project ? `project:${workflow.project}` : `domain:${workflow.domain}`, `flow:${workflow.id}`]));
-  projects.forEach((project) => (project.related_projects || []).forEach((relation) => links.push([`project:${project.id}`, `project:${relation.project}`])));
+  projects.forEach((project) => (project.related_projects || []).forEach((relation) => links.push([`project:${project.id}`, `project:${relation.project}`, true, relation.type])));
   skills.forEach((skill) => {
     let owner = 'core';
     if (skill.scope.project) owner = `project:${skill.scope.project}`;
@@ -277,31 +489,138 @@ function renderGraph() {
   const graphCanvas = $('#graphCanvas');
   graphCanvas.style.setProperty('--graph-height', `${graphHeight}px`);
   graphCanvas.style.setProperty('--graph-width', '1700px');
-  nodes.style.width = '1700px'; nodes.style.height = `${graphHeight}px`;
-  for (const [from, to, showVisual = true] of links) {
-    const a = positions.get(from); const b = positions.get(to); if (!a || !b) continue;
-    if (showVisual) {
-      const pathNode = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      const x1 = a.x + a.w; const y1 = a.y + a.h / 2; const x2 = b.x; const y2 = b.y + b.h / 2; const bend = Math.max(30, (x2 - x1) * .45);
-      pathNode.setAttribute('d', `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`); edges.append(pathNode);
-    }
-    relationText.append(element('li', '', `${from} → ${to}`));
-  }
+  graphView.links = links;
+  if (graphView.selectedEdge && !graphView.links.some(([from, to, , label]) => `${from}|${to}|${label}` === graphView.selectedEdge.key)) graphView.selectedEdge = null;
+  drawGraphEdges();
+  if (graphView.inspected) graphView.nodeIndex.get(graphView.inspected)?.node.classList.add('inspected');
+  if (graphView.userAdjusted) applyGraphTransform(); else fitGraphView();
   $('#graphCanvas').setAttribute('aria-label', `Graph: ${domains.length} domains, ${projects.length} projects, ${workflows.length} workflows, showing ${skills.length} of ${allGraphSkills.length} skills`);
+  for (const node of $$('.graph-node.project')) {
+    node.addEventListener('dragover', (event) => { if (event.dataTransfer.types.includes('text/plain')) { event.preventDefault(); node.classList.add('drop-target'); } });
+    node.addEventListener('dragleave', () => node.classList.remove('drop-target'));
+    node.addEventListener('drop', (event) => {
+      event.preventDefault(); node.classList.remove('drop-target');
+      const source = event.dataTransfer.getData('text/plain'); const target = node.dataset.projectId;
+      if (source && target && source !== target) openGraphRelationDialog(source, target);
+    });
+  }
+  for (const node of $$('.graph-node.domain')) {
+    const domain = domainById(node.dataset.domainId); if (!domain) continue;
+    node.addEventListener('dragover', (event) => { event.preventDefault(); node.classList.add('drop-target'); });
+    node.addEventListener('dragleave', () => node.classList.remove('drop-target'));
+    node.addEventListener('drop', async (event) => {
+      event.preventDefault(); node.classList.remove('drop-target'); const projectId = event.dataTransfer.getData('text/plain'); const project = projectById(projectId);
+      if (!project || project.domain === domain.id) return;
+      openGraphMoveDialog(project.id, domain.id);
+    });
+  }
+}
+
+function openGraphRelationDialog(sourceId, targetId) {
+  $('#graphRelationMode').value = 'relation';
+  $('#graphRelationSource').value = sourceId; $('#graphRelationTarget').value = targetId;
+  const preview = $('#graphRelationPreview'); clear(preview); preview.append(element('strong', '', projectById(sourceId).name), element('span', '', '→'), element('strong', '', projectById(targetId).name));
+  $('#graphRelationTitle').textContent = 'Create project link'; $('#graphRelationTypeField').hidden = false; $('#graphRelationType').required = true;
+  $('#graphRelationCopy').textContent = 'The connection is directional: source → target. You can edit or remove it later in the source project.'; $('#saveGraphRelation').textContent = 'Create connection';
+  $('#graphRelationType').value = 'uses'; $('#graphRelationDialog').showModal(); $('#graphRelationType').focus();
+}
+
+function openGraphMoveDialog(projectId, domainId) {
+  $('#graphRelationMode').value = 'move'; $('#graphRelationSource').value = projectId; $('#graphRelationTarget').value = domainId;
+  const preview = $('#graphRelationPreview'); clear(preview); preview.append(element('strong', '', projectById(projectId).name), element('span', '', '→'), element('strong', '', domainById(domainId).name));
+  $('#graphRelationTitle').textContent = 'Move project to domain'; $('#graphRelationTypeField').hidden = true; $('#graphRelationType').required = false;
+  $('#graphRelationCopy').textContent = 'The project and each of its workflows will move together. Files on disk stay in place.'; $('#saveGraphRelation').textContent = 'Move project';
+  $('#graphRelationDialog').showModal(); $('#saveGraphRelation').focus();
+}
+
+async function createGraphRelation(event) {
+  event.preventDefault(); const source = projectById($('#graphRelationSource').value); const targetId = $('#graphRelationTarget').value;
+  if ($('#graphRelationMode').value === 'move') {
+    const button = $('#saveGraphRelation'); button.disabled = true;
+    try {
+      const inventory = await window.agentBrain.updateProject({ id: source.id, name: source.name, domain: targetId, description: source.description || '', kind: source.kind || 'project', relatedProjects: source.related_projects || [], workspaceRules: source.workspace_rules || [] });
+      $('#graphRelationDialog').close(); replaceInventory(inventory); setView('graph'); showNotice('Project moved to a new domain.');
+    } catch (error) { showNotice(error.message, true); } finally { button.disabled = false; }
+    return;
+  }
+  const relation = { project: targetId, type: $('#graphRelationType').value.trim() };
+  if ((source.related_projects || []).some((item) => item.project === relation.project && item.type === relation.type)) { showNotice('This project connection already exists.', true); return; }
+  const button = $('#graphRelationForm button[type="submit"]'); button.disabled = true;
+  try {
+    const inventory = await window.agentBrain.updateProject({ id: source.id, name: source.name, domain: source.domain, description: source.description || '', kind: source.kind || 'project', relatedProjects: [...(source.related_projects || []), relation], workspaceRules: source.workspace_rules || [] });
+    $('#graphRelationDialog').close(); replaceInventory(inventory); setView('graph'); showNotice('Project connection created.');
+  } catch (error) { showNotice(error.message, true); } finally { button.disabled = false; }
+}
+
+function inspectorShell(title, code, badge) {
+  const inspector = $('#skillInspector'); clear(inspector); inspector.hidden = false;
+  const copy = element('div'); copy.append(element('h3', '', title), element('code', '', code));
+  const actions = element('div', 'skill-inspector-actions'); actions.append(element('span', 'tag', badge));
+  inspector.append(copy, actions);
+  return { inspector, actions };
+}
+
+function clearInspectedNode() {
+  graphView.inspected = null;
+  $$('.graph-node.inspected').forEach((node) => node.classList.remove('inspected'));
 }
 
 function selectSkill(id) {
   const skill = state.inventory.skills.find((item) => item.id === id);
   if (!skill) return;
   state.selectedSkill = id;
-  const inspector = $('#skillInspector'); clear(inspector); inspector.hidden = false;
-  const copy = element('div'); copy.append(element('h3', '', skill.name), element('code', '', skill.id));
-  inspector.append(copy, element('span', 'tag', skill.scope.level), element('p', '', skill.description || 'No description has been added.'));
+  clearInspectedNode();
+  const { inspector, actions } = inspectorShell(skill.name, skill.id, skill.scope.level);
+  const editScope = element('button', '', 'Change scope'); editScope.addEventListener('click', () => openSkillScopeDialog(skill)); actions.append(editScope);
+  inspector.append(element('p', '', skill.description || 'No description has been added.'));
   const tags = element('div', 'tag-list');
   tags.append(element('span', 'tag', `runtime: ${skill.runtimes.join(', ')}`), element('span', 'tag', `mounts: ${skill.mount_count}`), element('span', 'tag', skill.source_path));
   inspector.append(tags);
   setView('graph');
   inspector.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function inspectNode(kind, entity, nodeId) {
+  state.selectedSkill = null;
+  clearInspectedNode();
+  graphView.inspected = nodeId;
+  graphView.nodeIndex.get(nodeId)?.node.classList.add('inspected');
+  if (kind === 'domain') {
+    const { inspector, actions } = inspectorShell(entity.name, entity.id, 'domain');
+    const edit = element('button', '', 'Edit domain'); edit.addEventListener('click', () => openDomainDialog(entity)); actions.append(edit);
+    inspector.append(element('p', '', entity.description || 'No description has been added.'));
+    const directProjects = state.inventory.projects.filter((project) => project.domain === entity.id);
+    const domainSkills = state.inventory.skills.filter((skill) => skill.scope.domain === entity.id);
+    const tags = element('div', 'tag-list');
+    tags.append(element('span', 'tag', `projects: ${directProjects.length}`), element('span', 'tag', `domain skills: ${domainSkills.length}`), element('span', 'tag', entity.parent ? `parent: ${entity.parent}` : 'root domain'));
+    inspector.append(tags);
+  } else if (kind === 'project') {
+    const { inspector, actions } = inspectorShell(entity.name, entity.id, 'project');
+    const edit = element('button', '', 'Edit'); edit.addEventListener('click', () => openProjectEditor(entity)); actions.append(edit);
+    const open = element('button', '', 'Open in Projects'); open.addEventListener('click', () => { state.projectFilter = 'all'; state.selectedProject = entity.id; syncFilterButtons('#projectFilters', 'all'); renderProjects(); setView('projects'); }); actions.append(open);
+    const remove = element('button', '', 'Delete'); remove.addEventListener('click', () => openDeleteProjectDialog(entity)); actions.append(remove);
+    inspector.append(element('p', '', entity.description || 'No description has been added.'));
+    const c = entity.coverage;
+    const tags = element('div', 'tag-list');
+    tags.append(element('span', 'tag', entity.path), element('span', 'tag', `domain: ${entity.domain}`), element('span', 'tag', `instructions: ${c.instruction_count}`), element('span', 'tag', `skills: ${c.skill_count}`), element('span', 'tag', `workflows: ${c.workflow_count}`), element('span', 'tag', `links: ${c.related_project_count}`));
+    inspector.append(tags);
+  } else if (kind === 'flow') {
+    const { inspector, actions } = inspectorShell(entity.name, entity.id, 'workflow');
+    const edit = element('button', '', 'Edit workflow'); edit.addEventListener('click', () => openWorkflowDialog(entity)); actions.append(edit);
+    inspector.append(element('p', '', entity.description || 'No description has been added.'));
+    const tags = element('div', 'tag-list');
+    tags.append(element('span', 'tag', `owner: ${entity.project || entity.domain}`));
+    entity.steps.forEach((step, index) => tags.append(element('span', 'tag', `${index + 1}. ${step}`)));
+    inspector.append(tags);
+  } else {
+    const { inspector } = inspectorShell('Global Core', 'core', 'system');
+    inspector.append(element('p', '', 'Safety rules, precedence policy, and global skills that apply to every context.'));
+    const globalSkills = state.inventory.skills.filter((skill) => skill.scope.level === 'global');
+    const tags = element('div', 'tag-list');
+    tags.append(element('span', 'tag', `global skills: ${globalSkills.length}`), element('span', 'tag', `domains: ${state.inventory.domains.filter((domain) => !domain.parent).length}`));
+    inspector.append(tags);
+  }
+  $('#skillInspector').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 async function runSimulation() {
@@ -421,47 +740,291 @@ function populateGraphFilter(previous = 'all') {
   select.onchange = renderGraph;
 }
 
-function populateProjectDomains() {
+function populateProjectDomains(selected = 'personal.software') {
   const select = $('#projectDomain');
   clear(select);
   for (const domain of state.inventory.domains) {
     select.append(new Option(`${domain.name} · ${domain.id}`, domain.id));
   }
-  if ([...select.options].some((option) => option.value === 'personal.software')) {
-    select.value = 'personal.software';
+  if ([...select.options].some((option) => option.value === selected)) {
+    select.value = selected;
   }
+}
+
+function addProjectRelationRow(relation = {}) {
+  const row = element('div', 'form-row relation-edit-row');
+  const typeLabel = element('label', '', 'Type');
+  const type = document.createElement('input'); type.maxLength = 64; type.required = true; type.placeholder = 'uses'; type.value = relation.type || '';
+  typeLabel.append(type);
+  const projectLabel = element('label', '', 'Project');
+  const project = document.createElement('select'); project.required = true;
+  const currentId = $('#projectId').value;
+  for (const item of state.inventory.projects.filter((candidate) => candidate.id !== currentId)) {
+    project.append(new Option(`${item.name} · ${item.id}`, item.id));
+  }
+  if (relation.project) project.value = relation.project;
+  projectLabel.append(project);
+  const remove = element('button', 'form-row-remove', 'Remove'); remove.type = 'button'; remove.addEventListener('click', () => row.remove());
+  row.append(typeLabel, projectLabel, remove); $('#projectRelationRows').append(row);
+}
+
+function addWorkspaceRuleRow(rule = {}) {
+  const row = element('div', 'form-row workspace-row');
+  const rootLabel = element('label', '', 'Root'); const root = document.createElement('input'); root.required = true; root.placeholder = '~/worktrees'; root.value = rule.root || ''; rootLabel.append(root);
+  const pathLabel = element('label', '', 'Project path'); const projectPath = document.createElement('input'); projectPath.placeholder = 'my-project'; projectPath.value = rule.project_path || ''; pathLabel.append(projectPath);
+  const kindLabel = element('label', '', 'Kind'); const kind = document.createElement('input'); kind.required = true; kind.placeholder = 'worktree'; kind.value = rule.kind || 'worktree'; kindLabel.append(kind);
+  const dynamicLabel = element('label', 'checkbox-field'); const dynamic = document.createElement('input'); dynamic.type = 'checkbox'; dynamic.checked = Boolean(rule.dynamic_child); dynamicLabel.append(dynamic, document.createTextNode('Dynamic child'));
+  const remove = element('button', 'form-row-remove', 'Remove'); remove.type = 'button'; remove.addEventListener('click', () => row.remove());
+  row.append(rootLabel, pathLabel, kindLabel, dynamicLabel, remove); $('#workspaceRuleRows').append(row);
+}
+
+function readProjectRelations() {
+  return $$('.relation-edit-row').map((row) => ({
+    type: row.querySelector('input').value.trim(),
+    project: row.querySelector('select').value
+  }));
+}
+
+function readWorkspaceRules() {
+  return $$('.workspace-row').map((row) => {
+    const inputs = row.querySelectorAll('input');
+    return {
+      root: inputs[0].value.trim(),
+      project_path: inputs[1].value.trim(),
+      kind: inputs[2].value.trim(),
+      dynamic_child: inputs[3].checked
+    };
+  });
+}
+
+function populateWorkflowOwners(domain = 'meta.agent-system', project = '') {
+  const domainSelect = $('#workflowDomain'); clear(domainSelect);
+  for (const item of state.inventory.domains) domainSelect.append(new Option(`${item.name} · ${item.id}`, item.id));
+  if ([...domainSelect.options].some((option) => option.value === domain)) domainSelect.value = domain;
+  const projectSelect = $('#workflowProject'); clear(projectSelect); projectSelect.append(new Option('Domain-level workflow', ''));
+  for (const item of state.inventory.projects.filter((candidate) => candidate.domain === domainSelect.value)) {
+    projectSelect.append(new Option(`${item.name} · ${item.id}`, item.id));
+  }
+  if ([...projectSelect.options].some((option) => option.value === project)) projectSelect.value = project;
+}
+
+function addWorkflowStepRow(skillId = '') {
+  const row = element('div', 'form-row workflow-step-row');
+  const select = document.createElement('select'); select.required = true;
+  select.append(new Option('Choose a skill…', ''));
+  for (const skill of state.inventory.skills.filter((item) => item.scope.level !== 'archive')) select.append(new Option(`${skill.name} · ${skill.id}`, skill.id));
+  if (skillId) { if (![...select.options].some((option) => option.value === skillId)) select.append(new Option(`${skillId} · unresolved`, skillId)); select.value = skillId; }
+  const actions = element('div', 'step-actions');
+  const up = element('button', '', '↑'); up.type = 'button'; up.title = 'Move up'; up.addEventListener('click', () => { if (row.previousElementSibling) row.parentNode.insertBefore(row, row.previousElementSibling); });
+  const down = element('button', '', '↓'); down.type = 'button'; down.title = 'Move down'; down.addEventListener('click', () => { if (row.nextElementSibling) row.parentNode.insertBefore(row.nextElementSibling, row); });
+  const remove = element('button', 'remove-step', 'Remove'); remove.type = 'button'; remove.addEventListener('click', () => row.remove());
+  actions.append(up, down, remove); row.append(select, actions); $('#workflowStepRows').append(row);
+}
+
+function openWorkflowDialog(workflow = null) {
+  $('#workflowOriginalId').value = workflow?.id || '';
+  $('#workflowId').value = workflow?.id || '';
+  $('#workflowId').readOnly = Boolean(workflow);
+  $('#workflowName').value = workflow?.name || '';
+  $('#workflowDescription').value = workflow?.description || '';
+  clear($('#workflowStepRows')); (workflow?.steps || []).forEach(addWorkflowStepRow);
+  $('#workflowDialogTitle').textContent = workflow ? 'Edit workflow' : 'Add workflow';
+  $('#deleteWorkflowButton').hidden = !workflow;
+  populateWorkflowOwners(workflow?.domain, workflow?.project || '');
+  $('#workflowDialog').showModal();
+  (workflow ? $('#workflowName') : $('#workflowId')).focus();
+}
+
+async function saveWorkflow(event) {
+  event.preventDefault();
+  const button = $('#workflowForm button[type="submit"]'); button.disabled = true;
+  try {
+    const force = Boolean($('#workflowOriginalId').value);
+    const inventory = await window.agentBrain.saveWorkflow({
+      id: $('#workflowId').value.trim(), name: $('#workflowName').value.trim(),
+      domain: $('#workflowDomain').value, project: $('#workflowProject').value || undefined,
+      description: $('#workflowDescription').value.trim(),
+      steps: $$('#workflowStepRows select').map((select) => select.value).filter(Boolean), force
+    });
+    $('#workflowDialog').close(); replaceInventory(inventory); showNotice(force ? 'Workflow updated.' : 'Workflow created.');
+  } catch (error) { showNotice(error.message, true); } finally { button.disabled = false; }
+}
+
+async function deleteWorkflow() {
+  const workflow = state.inventory.workflows.find((item) => item.id === $('#workflowOriginalId').value);
+  if (!workflow) return;
+  $('#workflowDialog').close();
+  openDeleteEntityDialog('workflow', workflow.id, workflow.name);
+}
+
+async function openDomainDialog(domain = null) {
+  $('#domainOriginalId').value = domain?.id || '';
+  $('#domainId').value = domain?.id || '';
+  $('#domainId').readOnly = Boolean(domain);
+  $('#domainName').value = domain?.name || '';
+  $('#domainDescription').value = domain?.description || '';
+  $('#domainColor').value = /^#[0-9a-f]{6}$/i.test(domain?.color || '') ? domain.color : '#4aa8ff';
+  $('#domainIcon').value = domain?.icon || 'circle';
+  const parent = $('#domainParent'); clear(parent); parent.append(new Option('Root domain', ''));
+  for (const item of state.inventory.domains.filter((candidate) => candidate.id !== domain?.id)) parent.append(new Option(`${item.name} · ${item.id}`, item.id));
+  parent.value = domain?.parent || '';
+  $('#domainDialogTitle').textContent = domain ? 'Edit domain' : 'Add domain';
+  $('#deleteDomainButton').hidden = !domain;
+  const host = $('#domainDependencies'); clear(host);
+  if (domain) {
+    try {
+      const dependencies = await window.agentBrain.domainDependencies(domain.id);
+      for (const [label, values] of [['Child', dependencies.children], ['Project', dependencies.projects], ['Workflow', dependencies.workflows], ['Config', dependencies.config_references]]) {
+        for (const value of values) { const row = element('div', 'dependency-item'); row.append(element('span', '', label), element('strong', '', value)); host.append(row); }
+      }
+      $('#deleteDomainButton').disabled = Boolean(host.children.length);
+    } catch (error) { showNotice(error.message, true); return; }
+  }
+  $('#domainDialog').showModal();
+}
+
+async function saveDomain(event) {
+  event.preventDefault(); const button = $('#domainForm button[type="submit"]'); button.disabled = true;
+  try {
+    const force = Boolean($('#domainOriginalId').value);
+    const inventory = await window.agentBrain.saveDomain({
+      id: $('#domainId').value.trim(), name: $('#domainName').value.trim(),
+      parent: $('#domainParent').value || undefined, color: $('#domainColor').value,
+      icon: $('#domainIcon').value.trim(), description: $('#domainDescription').value.trim(), force
+    });
+    $('#domainDialog').close(); replaceInventory(inventory); showNotice(force ? 'Domain updated.' : 'Domain created.');
+  } catch (error) { showNotice(error.message, true); } finally { button.disabled = false; }
+}
+
+async function deleteDomain() {
+  const domain = domainById($('#domainOriginalId').value); if (!domain) return;
+  $('#domainDialog').close();
+  openDeleteEntityDialog('domain', domain.id, domain.name);
+}
+
+function openDeleteEntityDialog(kind, id, name) {
+  const dialog = $('#deleteEntityDialog'); dialog.dataset.kind = kind; dialog.dataset.id = id;
+  $('#deleteEntityTitle').textContent = `Delete ${name}?`;
+  $('#deleteEntityCopy').textContent = kind === 'workflow'
+    ? 'The ordered workflow will be removed from the registry.'
+    : 'The empty domain will be removed from the registry.';
+  dialog.showModal(); $('#confirmDeleteEntity').focus();
+}
+
+async function confirmEntityDelete(event) {
+  event.preventDefault(); const dialog = $('#deleteEntityDialog'); const button = $('#confirmDeleteEntity'); button.disabled = true;
+  try {
+    if (dialog.dataset.kind === 'relation') {
+      const source = projectById(dialog.dataset.id);
+      const relatedProjects = (source.related_projects || []).filter((item) => !(item.project === dialog.dataset.target && item.type === dialog.dataset.relationType));
+      const inventory = await window.agentBrain.updateProject({ id: source.id, name: source.name, domain: source.domain, description: source.description || '', kind: source.kind || 'project', relatedProjects, workspaceRules: source.workspace_rules || [] });
+      dialog.close(); graphView.selectedEdge = null; replaceInventory(inventory); showNotice('Project connection deleted.');
+      return;
+    }
+    const payload = { id: dialog.dataset.id, confirmed: true };
+    const inventory = dialog.dataset.kind === 'workflow'
+      ? await window.agentBrain.deleteWorkflow(payload)
+      : await window.agentBrain.deleteDomain(payload);
+    dialog.close(); replaceInventory(inventory); showNotice(dialog.dataset.kind === 'workflow' ? 'Workflow deleted.' : 'Domain deleted.');
+  } catch (error) { showNotice(error.message, true); } finally { button.disabled = false; }
+}
+
+function syncSkillScopeFields() {
+  const level = $('#skillScopeLevel').value;
+  $('#skillScopeDomainField').hidden = level !== 'domain';
+  $('#skillScopeProjectField').hidden = level !== 'project';
+  $('#skillScopePluginField').hidden = level !== 'plugin';
+}
+
+function openSkillScopeDialog(skill) {
+  $('#skillScopeId').value = skill.id; $('#skillScopeTitle').textContent = skill.name;
+  $('#skillScopeCopy').textContent = skill.source_path;
+  const override = (state.inventory.config.skill_scope_rules || []).find((rule) => {
+    if (!String(rule.managed_by || '').startsWith('gui-source:') || !rule.source_pattern) return false;
+    try { return new RegExp(rule.source_pattern).test(skill.source_path); } catch { return false; }
+  });
+  $('#skillScopeLevel').value = override?.level || 'auto';
+  const domains = $('#skillScopeDomain'); clear(domains); state.inventory.domains.forEach((item) => domains.append(new Option(`${item.name} · ${item.id}`, item.id))); domains.value = skill.scope.domain || domains.value;
+  const projects = $('#skillScopeProject'); clear(projects); state.inventory.projects.forEach((item) => projects.append(new Option(`${item.name} · ${item.id}`, item.id))); projects.value = skill.scope.project || projects.value;
+  $('#skillScopePlugin').value = override?.plugin || skill.scope.plugin || '';
+  syncSkillScopeFields(); $('#skillScopeDialog').showModal();
+}
+
+async function saveSkillScope(event) {
+  event.preventDefault(); const button = $('#skillScopeForm button[type="submit"]'); button.disabled = true;
+  try {
+    const level = $('#skillScopeLevel').value;
+    const inventory = await window.agentBrain.updateSkillScope({
+      id: $('#skillScopeId').value, level,
+      domain: level === 'domain' ? $('#skillScopeDomain').value : undefined,
+      project: level === 'project' ? $('#skillScopeProject').value : undefined,
+      plugin: level === 'plugin' ? $('#skillScopePlugin').value.trim() : undefined
+    });
+    $('#skillScopeDialog').close(); state.selectedSkill = null; replaceInventory(inventory); setView('graph'); showNotice('Skill scope updated.');
+  } catch (error) { showNotice(error.message, true); } finally { button.disabled = false; }
 }
 
 async function openProjectDialog() {
   const projectPath = await window.agentBrain.chooseDirectory();
   if (!projectPath) return;
+  $('#projectId').value = '';
   $('#projectPath').value = projectPath;
-  $('#projectName').value = '';
+  $('#projectName').value = projectPath.split('/').filter(Boolean).pop().replaceAll('-', ' ');
   $('#projectDescription').value = '';
+  $('#projectKind').value = 'software-project';
+  clear($('#projectRelationRows')); clear($('#workspaceRuleRows'));
+  $('#projectAdvancedFields').hidden = true; $('#projectWorkspaceFields').hidden = true;
+  $('#projectDialogTitle').textContent = 'Add a project';
+  $('#projectDialogCopy').textContent = 'Agent Brain will detect AGENTS.md, CLAUDE.md, and local skill folders automatically.';
+  $('#saveProjectButton').textContent = 'Add project';
   populateProjectDomains();
   $('#projectDialog').showModal();
   $('#projectName').focus();
 }
 
-async function addProject(event) {
+function openProjectEditor(project) {
+  $('#projectId').value = project.id;
+  $('#projectPath').value = project.path;
+  $('#projectName').value = project.name;
+  $('#projectDescription').value = project.description || '';
+  $('#projectKind').value = project.kind || 'project';
+  clear($('#projectRelationRows')); clear($('#workspaceRuleRows'));
+  (project.related_projects || []).forEach(addProjectRelationRow);
+  (project.workspace_rules || []).forEach(addWorkspaceRuleRow);
+  $('#projectAdvancedFields').hidden = false; $('#projectWorkspaceFields').hidden = false;
+  $('#projectDialogTitle').textContent = 'Edit project';
+  $('#projectDialogCopy').textContent = 'Update registry metadata. Moving domains also keeps project workflows in the same domain.';
+  $('#saveProjectButton').textContent = 'Save changes';
+  populateProjectDomains(project.domain);
+  $('#projectDialog').showModal();
+  $('#projectName').focus();
+}
+
+async function saveProject(event) {
   event.preventDefault();
   const submit = $('#projectForm button[type="submit"]');
   submit.disabled = true;
   try {
-    const inventory = await window.agentBrain.addProject({
-      path: $('#projectPath').value,
-      name: $('#projectName').value.trim() || undefined,
+    const id = $('#projectId').value;
+    const fields = {
+      name: $('#projectName').value.trim(),
       domain: $('#projectDomain').value,
-      description: $('#projectDescription').value.trim() || undefined
-    });
+      kind: $('#projectKind').value.trim(),
+      description: $('#projectDescription').value.trim(),
+      relatedProjects: id ? readProjectRelations() : undefined,
+      workspaceRules: id ? readWorkspaceRules() : undefined
+    };
+    const inventory = id
+      ? await window.agentBrain.updateProject({ id, ...fields })
+      : await window.agentBrain.addProject({ path: $('#projectPath').value, ...fields });
     $('#projectDialog').close();
     replaceInventory(inventory);
     state.projectFilter = 'all';
-    state.selectedProject = inventory.projects.find((project) => project.path === $('#projectPath').value)?.id || null;
+    state.selectedProject = id || inventory.projects.find((project) => project.path === $('#projectPath').value)?.id || null;
     syncFilterButtons('#projectFilters', 'all');
     renderProjects();
     setView('projects');
-    showNotice('Project added to the registry.');
+    showNotice(id ? 'Project updated.' : 'Project added to the registry.');
   } catch (error) {
     showNotice(error.message, true);
   } finally {
@@ -469,7 +1032,46 @@ async function addProject(event) {
   }
 }
 
-function renderAll() { const graphFilter = $('#graphDomain').value || 'all'; renderShell(); renderMetrics(); renderDomains(); renderCoverage(); renderWorkflows(); renderProjects(); renderConflicts(); populateGraphFilter(graphFilter); syncFilterButtons('#projectFilters', state.projectFilter); syncFilterButtons('#conflictFilters', state.conflictFilter); setView(state.view); if (state.validation) renderHealth(); }
+async function openDeleteProjectDialog(project) {
+  try {
+    const dependencies = await window.agentBrain.projectDependencies(project.id);
+    $('#deleteProjectDialog').dataset.projectId = project.id;
+    $('#deleteProjectTitle').textContent = `Remove ${project.name}?`;
+    $('#deleteProjectCopy').textContent = 'This removes the project manifest from Agent Brain.';
+    const host = $('#deleteProjectDependencies'); clear(host);
+    for (const relation of dependencies.incoming_relations) {
+      const row = element('div', 'dependency-item'); row.append(element('span', '', `Incoming · ${relation.type}`), element('strong', '', projectById(relation.project)?.name || relation.project)); host.append(row);
+    }
+    for (const workflow of dependencies.workflows) {
+      const name = state.inventory.workflows.find((item) => item.id === workflow)?.name || workflow;
+      const row = element('div', 'dependency-item'); row.append(element('span', '', 'Workflow'), element('strong', '', name)); host.append(row);
+    }
+    if (host.children.length) $('#deleteProjectCopy').textContent = 'The following registry references will also be removed:';
+    $('#deleteProjectDialog').showModal();
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+}
+
+async function deleteProject(event) {
+  event.preventDefault();
+  const button = $('#confirmDeleteProject'); button.disabled = true;
+  try {
+    const id = $('#deleteProjectDialog').dataset.projectId;
+    const inventory = await window.agentBrain.deleteProject({ id, cascade: true });
+    $('#deleteProjectDialog').close();
+    state.selectedProject = null;
+    replaceInventory(inventory);
+    setView('projects');
+    showNotice('Project removed from the registry. External files were preserved.');
+  } catch (error) {
+    showNotice(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderAll() { const graphFilter = $('#graphDomain').value || 'all'; renderShell(); renderMetrics(); renderDomains(); renderCoverage(); renderWorkflows(); renderProjectFilters(); renderProjects(); renderConflicts(); populateGraphFilter(graphFilter); syncFilterButtons('#conflictFilters', state.conflictFilter); setView(state.view); if (state.validation) renderHealth(); }
 
 function replaceInventory(inventory) {
   state.inventory = inventory;
@@ -478,20 +1080,77 @@ function replaceInventory(inventory) {
   if (state.view === 'health') runValidation();
 }
 
+function bindGraphEvents() {
+  const canvas = $('#graphCanvas');
+  canvas.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || event.target.closest('.graph-node, .graph-controls, .edge-toolbar')) return;
+    clearEdgeSelection();
+    graphView.userAdjusted = true;
+    const start = { x: event.clientX, y: event.clientY }; const origin = { ...graphView.pan };
+    canvas.classList.add('panning');
+    const onMove = (move) => { graphView.pan.x = origin.x + move.clientX - start.x; graphView.pan.y = origin.y + move.clientY - start.y; applyGraphTransform(); };
+    const onUp = () => { canvas.classList.remove('panning'); window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); };
+    window.addEventListener('pointermove', onMove); window.addEventListener('pointerup', onUp);
+  });
+  canvas.addEventListener('wheel', (event) => {
+    event.preventDefault();
+    graphView.userAdjusted = true;
+    if (event.ctrlKey || event.metaKey) {
+      const rect = canvas.getBoundingClientRect();
+      setGraphZoom(graphView.zoom * Math.exp(-event.deltaY * .01), event.clientX - rect.left, event.clientY - rect.top);
+    } else {
+      graphView.pan.x -= event.deltaX; graphView.pan.y -= event.deltaY; applyGraphTransform();
+    }
+  }, { passive: false });
+  $('#graphZoomIn').addEventListener('click', () => { graphView.userAdjusted = true; setGraphZoom(graphView.zoom * 1.2); });
+  $('#graphZoomOut').addEventListener('click', () => { graphView.userAdjusted = true; setGraphZoom(graphView.zoom / 1.2); });
+  $('#graphZoomReset').addEventListener('click', () => { graphView.userAdjusted = true; graphView.zoom = 1; graphView.pan = { x: 24, y: 24 }; applyGraphTransform(); });
+  $('#graphZoomFit').addEventListener('click', () => { graphView.userAdjusted = true; fitGraphView(); });
+  $('#edgeDeleteButton').addEventListener('click', () => { if (graphView.selectedEdge) openDeleteRelationDialog(graphView.selectedEdge); });
+}
+
 function bindEvents() {
+  bindGraphEvents();
   $$('.nav-item').forEach((button) => button.addEventListener('click', () => setView(button.dataset.view)));
   $('#projectFilters').addEventListener('click', (event) => { const button = event.target.closest('button'); if (!button) return; state.projectFilter = button.dataset.filter; syncFilterButtons('#projectFilters', state.projectFilter); renderProjects(); });
   $('#conflictFilters').addEventListener('click', (event) => { const button = event.target.closest('button'); if (!button) return; state.conflictFilter = button.dataset.filter; syncFilterButtons('#conflictFilters', state.conflictFilter); renderConflicts(); });
   $('#choosePath').addEventListener('click', async () => { const path = await window.agentBrain.chooseDirectory(); if (path) { $('#simulatorPath').value = path; runSimulation(); } });
   $('#addProjectButton').addEventListener('click', openProjectDialog);
-  $('#projectForm').addEventListener('submit', addProject);
+  $('#projectForm').addEventListener('submit', saveProject);
   $('#closeProjectDialog').addEventListener('click', () => $('#projectDialog').close());
   $('#cancelProjectDialog').addEventListener('click', () => $('#projectDialog').close());
+  $('#deleteProjectForm').addEventListener('submit', deleteProject);
+  $('#closeDeleteProjectDialog').addEventListener('click', () => $('#deleteProjectDialog').close());
+  $('#cancelDeleteProject').addEventListener('click', () => $('#deleteProjectDialog').close());
+  $('#addProjectRelation').addEventListener('click', () => addProjectRelationRow());
+  $('#addWorkspaceRule').addEventListener('click', () => addWorkspaceRuleRow());
+  $('#addWorkflowButton').addEventListener('click', () => openWorkflowDialog());
+  $('#workflowForm').addEventListener('submit', saveWorkflow);
+  $('#workflowDomain').addEventListener('change', () => populateWorkflowOwners($('#workflowDomain').value));
+  $('#deleteWorkflowButton').addEventListener('click', deleteWorkflow);
+  $('#closeWorkflowDialog').addEventListener('click', () => $('#workflowDialog').close());
+  $('#cancelWorkflowDialog').addEventListener('click', () => $('#workflowDialog').close());
+  $('#addWorkflowStep').addEventListener('click', () => addWorkflowStepRow());
+  $('#addDomainButton').addEventListener('click', () => openDomainDialog());
+  $('#domainForm').addEventListener('submit', saveDomain);
+  $('#deleteDomainButton').addEventListener('click', deleteDomain);
+  $('#closeDomainDialog').addEventListener('click', () => $('#domainDialog').close());
+  $('#cancelDomainDialog').addEventListener('click', () => $('#domainDialog').close());
+  $('#skillScopeLevel').addEventListener('change', syncSkillScopeFields);
+  $('#skillScopeForm').addEventListener('submit', saveSkillScope);
+  $('#closeSkillScopeDialog').addEventListener('click', () => $('#skillScopeDialog').close());
+  $('#cancelSkillScopeDialog').addEventListener('click', () => $('#skillScopeDialog').close());
+  $('#graphRelationForm').addEventListener('submit', createGraphRelation);
+  $('#closeGraphRelationDialog').addEventListener('click', () => $('#graphRelationDialog').close());
+  $('#cancelGraphRelation').addEventListener('click', () => $('#graphRelationDialog').close());
+  $('#deleteEntityForm').addEventListener('submit', confirmEntityDelete);
+  $('#closeDeleteEntityDialog').addEventListener('click', () => $('#deleteEntityDialog').close());
+  $('#cancelDeleteEntity').addEventListener('click', () => $('#deleteEntityDialog').close());
   $('#simulateButton').addEventListener('click', runSimulation); $('#simulatorPath').addEventListener('keydown', (event) => { if (event.key === 'Enter') runSimulation(); });
   $('#runHealth').addEventListener('click', runValidation); $('#validateButton').addEventListener('click', () => { const alreadyValidated = Boolean(state.validation); setView('health'); if (alreadyValidated) runValidation(); });
   $('#refreshButton').addEventListener('click', async () => { const button = $('#refreshButton'); button.classList.add('busy'); button.disabled = true; try { replaceInventory(await window.agentBrain.refresh()); setRuntimeStatus('online', 'Registry online'); showNotice('Registry refreshed.'); } catch (error) { setRuntimeStatus(state.inventory ? 'stale' : 'offline', state.inventory ? 'Registry stale' : 'Registry offline'); showNotice(error.message, true); } finally { button.classList.remove('busy'); button.disabled = false; } });
   $('#globalSearch').addEventListener('input', (event) => renderSearch(event.target.value));
-  document.addEventListener('keydown', (event) => { if (event.key === 'Escape') $('#searchOverlay').hidden = true; if (!state.inventory) return; if (event.metaKey && event.key.toLowerCase() === 'k') { event.preventDefault(); $('#globalSearch').focus(); } if (!event.metaKey && !event.ctrlKey && !event.altKey && /^[1-6]$/.test(event.key) && document.activeElement.tagName !== 'INPUT') { setView(['portfolio','projects','graph','simulator','conflicts','health'][Number(event.key)-1]); } });
+  document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { $('#searchOverlay').hidden = true; clearEdgeSelection(); } if (!state.inventory) return; if (event.metaKey && event.key.toLowerCase() === 'k') { event.preventDefault(); $('#globalSearch').focus(); } if (!event.metaKey && !event.ctrlKey && !event.altKey && /^[1-6]$/.test(event.key) && document.activeElement.tagName !== 'INPUT') { setView(['portfolio','projects','graph','simulator','conflicts','health'][Number(event.key)-1]); } });
   window.agentBrain.onInventoryUpdated((inventory) => { if (inventory.error) { setRuntimeStatus(state.inventory ? 'stale' : 'offline', state.inventory ? 'Registry stale' : 'Registry offline'); showNotice(inventory.error, true); } else { replaceInventory(inventory); setRuntimeStatus('online', 'Registry online'); showNotice('Manifest changes were loaded automatically.'); } });
 }
 

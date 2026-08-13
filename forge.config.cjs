@@ -49,12 +49,15 @@ module.exports = {
       /^\/workflows/,
       /^\/web/,
       /^\/\.playwright-cli/,
+      /^\/node_modules\/(?:@playwright|playwright(?:-core)?)(?:\/|$)/,
       /^\/brain\.py$/,
       /^\/AGENTS\.md$/,
       /^\/README\.md$/,
       /^\/THIRD_PARTY_NOTICES\.md$/,
       /^\/Open Agent Brain\.command$/,
+      /^\/playwright\.config\.cjs$/,
       /^\/electron\/test/,
+      /^\/electron\/visual/,
       /^\/electron\/package-smoke\.cjs$/
     ]
   },

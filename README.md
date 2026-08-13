@@ -7,6 +7,21 @@ belong in this folder?**
 
 ![Agent Brain desktop](docs/screenshot.png)
 
+## Key capabilities
+
+- **Interactive knowledge graph** — pan, zoom, and drag nodes freely on the
+  canvas; connect projects by dragging from node ports with a live edge
+  preview; click any edge to inspect or delete the relationship.
+- **Node inspector** — click any domain, project, workflow, or skill node to
+  see its details and act on it (edit, delete, change scope) without leaving
+  the graph.
+- **Context resolver** — simulate any folder and see exactly which domain,
+  project, workspace, skills, and workflows an agent will receive there.
+- **Collision radar and health checks** — find same-name skills and broken
+  references before they surprise an agent mid-task.
+- **Local-first** — plain JSON and Markdown registry in `~/.agent-brain`;
+  nothing leaves your machine.
+
 ## Why
 
 Agent runtimes can mount many skills globally even when those skills belong to
@@ -51,13 +66,14 @@ same graph without copying their contents.
 Requirements: macOS 12+, Python 3.9+, Node.js 20+. The DMG bundles Python and
 does not require a separate Python installation.
 
+One command from clone to a running app:
+
 ```bash
-git clone https://github.com/InfinityScripter/agent-brain.git
-cd agent-brain
-npm ci
-./bin/brain init
-npm start
+git clone https://github.com/InfinityScripter/agent-brain.git && cd agent-brain && npm ci && npm start
 ```
+
+`npm start` initializes the private registry on first launch. To prepare the
+registry from the terminal instead, run `./bin/brain init` before `npm start`.
 
 Register a project:
 
@@ -68,8 +84,12 @@ Register a project:
 ```
 
 Agent Brain detects `AGENTS.md`, `CLAUDE.md`, and project-local skill roots.
-You can further edit the generated manifest under
-`~/.agent-brain/projects/<project>.json` to describe relations and worktrees.
+The desktop app can then edit or remove the registry entry, move it between
+domains, manage typed project relationships and worktree rules, and preserve
+the external project folder. Portfolio editors create domains and ordered
+workflows; the graph supports drag-and-drop project links and moves plus a
+keyboard-accessible form alternative. Skill Inspector can assign global,
+domain, project, plugin, archive, or automatic source-based ownership.
 
 ## CLI
 
@@ -82,6 +102,12 @@ You can further edit the generated manifest under
 ./bin/brain use personal
 ./bin/brain use auto
 ./bin/brain serve
+./bin/brain project update my-app --domain work
+./bin/brain project dependencies my-app --json
+./bin/brain project delete my-app --cascade
+./bin/brain workflow save release --name "Release" --domain work --steps-json '["global.review"]'
+./bin/brain domain save research --name "Research"
+./bin/brain skill scope project.my-app.review --level domain --domain work
 ```
 
 Use a custom registry directory with either:
@@ -165,6 +191,7 @@ or skill contents.
 ```bash
 python3 -m unittest discover -s tests -v
 npm test
+npm run test:visual
 ./bin/brain validate
 npm run package:universal
 npm run test:package
