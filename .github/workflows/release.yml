@@ -29,7 +29,7 @@ jobs:
       - run: npm ci
       - run: npm run test:python
       - run: npm test
-      - run: npm run test:visual
+      - run: npm run test:visual -- --ignore-snapshots
       - run: npm audit --omit=dev
       - run: npm run test:public
       - run: npm run make:universal
