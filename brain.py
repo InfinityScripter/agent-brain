@@ -1368,9 +1368,45 @@ def generate_audit(inventory: Dict[str, Any]) -> str:
         f"- Unresolved same-name collisions: **{stats['unresolved_collision_count']}**",
         f"- Broken configured sources: **{stats['broken_count']}**",
         "",
-        "## Severity-ranked findings",
-        "",
     ]
+    usage = stats.get("usage")
+    if usage:
+        config = inventory_config(inventory)
+        running_plugins = set(config.get("active_plugins") or [])
+        listed = [
+            skill for skill in inventory["skills"]
+            if skill["scope"]["level"] != "archive"
+            and skill.get("model_invocable", True)
+            and "claude" in skill["runtimes"]
+            and (skill.get("plugin_source") or skill["scope"].get("plugin") or None) in running_plugins | {None}
+        ]
+        cap = (config.get("listing_limits") or {}).get("max_desc_chars")
+        def listing_cost(items: Sequence[Dict[str, Any]]) -> int:
+            chars = sum(
+                min(len(item["description"]), cap or len(item["description"])) + len(item["name"]) + 12
+                for item in items
+            )
+            return round(chars / 3)
+        lines.extend(
+            [
+                "## Usage",
+                "",
+                f"- Skills with a usage counter: **{usage['tracked']}**",
+                f"- Invoked at least once: **{usage['used']}**",
+                f"- Never invoked: **{usage['never_used']}**",
+                f"- Idle over 30 days: **{usage['idle_over_30d']}**",
+                f"- Total invocations: **{usage['total_invocations']}**",
+                f"- Listed to the model: **{len(listed)}** skills, about **{listing_cost(listed)}** tokens per session",
+                f"- Of those never invoked: about **{listing_cost([item for item in listed if not item['usage']['count']])}** tokens",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Severity-ranked findings",
+            "",
+        ]
+    )
     if inventory["collisions"]:
         lines.extend(
             [

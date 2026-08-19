@@ -639,6 +639,46 @@ class ListingOverrideTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"skillOverrides": {"x": "user-invocable-only"}})
 
 
+class UsageReportTests(unittest.TestCase):
+    """The audit report carries the usage numbers, not just the inventory."""
+
+    def test_audit_reports_usage_and_idle_counts(self):
+        inventory = {
+            "generated_at": "2026-08-19T00:00:00+00:00",
+            "instructions": [],
+            "collisions": [],
+            "broken_sources": [],
+            "projects": [],
+            "domains": [],
+            "skills": [],
+            "config": {"listing_limits": {"max_desc_chars": 200, "budget_fraction": 0.05}},
+            "stats": {
+                "skill_sources": 3, "skill_mounts": 3, "domain_count": 1, "project_count": 0,
+                "workflow_count": 0, "collision_count": 0, "unresolved_collision_count": 0,
+                "broken_count": 0,
+                "usage": {"tracked": 3, "used": 2, "never_used": 1, "idle_over_30d": 1, "total_invocations": 12},
+            },
+        }
+        report = brain.generate_audit(inventory)
+        self.assertIn("## Usage", report)
+        self.assertIn("Never invoked: **1**", report)
+        self.assertIn("Idle over 30 days: **1**", report)
+        self.assertIn("Total invocations: **12**", report)
+
+    def test_audit_survives_a_registry_without_usage_stats(self):
+        inventory = {
+            "generated_at": "2026-08-19T00:00:00+00:00",
+            "instructions": [], "collisions": [], "broken_sources": [], "projects": [],
+            "domains": [], "skills": [], "config": {},
+            "stats": {
+                "skill_sources": 1, "skill_mounts": 1, "domain_count": 1, "project_count": 0,
+                "workflow_count": 0, "collision_count": 0, "unresolved_collision_count": 0,
+                "broken_count": 0,
+            },
+        }
+        self.assertNotIn("## Usage", brain.generate_audit(inventory))
+
+
 class ModelVisibilityTests(unittest.TestCase):
     """Skills hidden from the model still cost nothing in the listing."""
 
