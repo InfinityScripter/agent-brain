@@ -417,5 +417,264 @@ class AgentBrainTests(unittest.TestCase):
         self.assertTrue(any("source_pattern is invalid" in error for error in report["errors"]))
 
 
+class ClaudePluginTests(unittest.TestCase):
+    """Plugin skills installed by Claude Code under ~/.claude/plugins."""
+
+    def test_plugin_identity_uses_plugin_name_not_marketplace(self):
+        source = Path("/home/u/.claude/plugins/cache/thedotmack/claude-mem/13.12.4/skills/babysit")
+        self.assertEqual(brain.plugin_identity(source), "claude-mem")
+
+    def test_plugin_identity_handles_commit_sha_versions(self):
+        source = Path("/home/u/.claude/plugins/cache/claude-plugins-official/frontend-design/5fd8350ff8ed/skills/x")
+        self.assertEqual(brain.plugin_identity(source), "frontend-design")
+
+    def test_codex_plugin_identity_is_unchanged(self):
+        source = Path("/home/u/.codex/plugins/cache/superpowers/1.2.0/skills/brainstorming")
+        self.assertEqual(brain.plugin_identity(source), "superpowers")
+
+    def test_plugin_roots_point_at_installed_versions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            install = root / "cache" / "thedotmack" / "claude-mem" / "13.12.4"
+            (install / "skills").mkdir(parents=True)
+            (root / "installed_plugins.json").write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "plugins": {
+                            "claude-mem@thedotmack": [{"scope": "user", "installPath": str(install)}],
+                            "absent@somewhere": [{"scope": "user", "installPath": str(root / "missing")}],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            roots = brain.plugin_skill_roots(root)
+        self.assertEqual(len(roots), 1)
+        self.assertEqual(roots[0]["path"], str(install / "skills"))
+        self.assertEqual(roots[0]["runtime"], "claude")
+
+    def test_plugin_roots_skip_project_scoped_installs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            install = root / "cache" / "m" / "p" / "1.0.0"
+            (install / "skills").mkdir(parents=True)
+            (root / "installed_plugins.json").write_text(
+                json.dumps({"plugins": {"p@m": [{"scope": "project", "installPath": str(install)}]}}),
+                encoding="utf-8",
+            )
+            roots = brain.plugin_skill_roots(root)
+        self.assertEqual(roots, [])
+
+    def test_missing_plugin_registry_yields_no_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(brain.plugin_skill_roots(Path(directory) / "absent"), [])
+
+    def make_plugin(self, root: Path, manifest_skills, skill_names) -> Path:
+        install = root / "cache" / "market" / "demo" / "1.0.0"
+        (install / ".claude-plugin").mkdir(parents=True)
+        for name in skill_names:
+            skill_dir = install / "skills" / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(f"---\nname: {name}\ndescription: d\n---\n", encoding="utf-8")
+        manifest = {"name": "demo"}
+        if manifest_skills is not None:
+            manifest["skills"] = manifest_skills
+        (install / ".claude-plugin" / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+        (root / "installed_plugins.json").write_text(
+            json.dumps({"plugins": {"demo@market": [{"scope": "user", "installPath": str(install)}]}}),
+            encoding="utf-8",
+        )
+        return install
+
+    def test_manifest_limits_root_to_declared_skills(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            install = self.make_plugin(root, ["./skills/wanted"], ["wanted", "leftover"])
+            roots = brain.plugin_skill_roots(root)
+        self.assertEqual(roots[0]["declared"], [str(install / "skills" / "wanted")])
+
+    def test_plugin_without_manifest_list_declares_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_plugin(root, None, ["only"])
+            roots = brain.plugin_skill_roots(root)
+        self.assertNotIn("declared", roots[0])
+
+    def test_undeclared_plugin_skill_is_not_collected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_plugin(root, ["./skills/wanted"], ["wanted", "leftover"])
+            config = {"skill_roots": brain.plugin_skill_roots(root)}
+            occurrences, _broken = brain.collect_skill_occurrences(config, [])
+        self.assertEqual([item["logical_name"] for item in occurrences], ["wanted"])
+
+    def test_scan_config_appends_plugin_roots_without_duplicates(self):
+        discovered = [
+            {"path": "/skills/shared", "runtime": "claude", "kind": "mount", "plugin": "dup"},
+            {"path": "/plugins/mem/skills", "runtime": "claude", "kind": "mount", "plugin": "claude-mem"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "brain.json"
+            config_path.write_text(
+                json.dumps({"skill_roots": [{"path": "/skills/shared", "runtime": "shared", "kind": "canonical"}]}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(brain, "CONFIG_PATH", config_path), mock.patch.object(
+                brain, "plugin_skill_roots", return_value=discovered
+            ):
+                config = brain.scan_config()
+        self.assertEqual([item["path"] for item in config["skill_roots"]], ["/skills/shared", "/plugins/mem/skills"])
+
+    def test_listing_limits_read_from_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(
+                json.dumps({"skillListingMaxDescChars": 200, "skillListingBudgetFraction": 0.05}),
+                encoding="utf-8",
+            )
+            limits = brain.read_listing_limits(path)
+        self.assertEqual(limits, {"max_desc_chars": 200, "budget_fraction": 0.05})
+
+    def test_listing_limits_absent_settings_are_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            limits = brain.read_listing_limits(Path(directory) / "absent.json")
+        self.assertEqual(limits, {"max_desc_chars": None, "budget_fraction": None})
+
+    def test_enabled_plugins_drop_marketplace_suffix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(
+                json.dumps({"enabledPlugins": {"superpowers@official": True, "ponytail@ponytail": False}}),
+                encoding="utf-8",
+            )
+            self.assertEqual(brain.read_enabled_plugins(path), ["superpowers"])
+
+
+class ModelVisibilityTests(unittest.TestCase):
+    """Skills hidden from the model still cost nothing in the listing."""
+
+    def parse(self, frontmatter: str) -> dict:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "SKILL.md"
+            path.write_text(f"---\n{frontmatter}\n---\nbody\n", encoding="utf-8")
+            return brain.parse_skill_metadata(path, "fallback")
+
+    def test_plain_skill_is_model_invocable(self):
+        self.assertTrue(self.parse("name: x\ndescription: d")["model_invocable"])
+
+    def test_disable_model_invocation_hides_skill_from_model(self):
+        self.assertFalse(self.parse("name: x\ndescription: d\ndisable-model-invocation: true")["model_invocable"])
+
+    def test_false_flag_keeps_skill_visible(self):
+        self.assertTrue(self.parse("name: x\ndescription: d\ndisable-model-invocation: false")["model_invocable"])
+
+
+class SkillUsageTests(unittest.TestCase):
+    """Usage counters that Claude Code maintains in ~/.claude.json."""
+
+    def write_state(self, directory: str, usage: dict) -> Path:
+        path = Path(directory) / "claude.json"
+        path.write_text(json.dumps({"skillUsage": usage}), encoding="utf-8")
+        return path
+
+    def test_reads_counts_and_last_used_date(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_state(directory, {"review": {"usageCount": 27, "lastUsedAt": 1786543318694}})
+            usage = brain.read_skill_usage(path)
+        self.assertEqual(usage["review"]["count"], 27)
+        self.assertEqual(usage["review"]["last_used"], "2026-08-12")
+
+    def test_missing_state_file_yields_empty_usage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            usage = brain.read_skill_usage(Path(directory) / "absent.json")
+        self.assertEqual(usage, {})
+
+    def test_entry_without_timestamp_keeps_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_state(directory, {"solo": {"usageCount": 3}})
+            usage = brain.read_skill_usage(path)
+        self.assertEqual(usage["solo"]["count"], 3)
+        self.assertIsNone(usage["solo"]["last_used"])
+
+    def test_plugin_skill_matches_namespaced_counter(self):
+        skills = [
+            {
+                "name": "brainstorming",
+                "scope": {"level": "plugin", "domain": None, "project": None, "plugin": "superpowers"},
+            }
+        ]
+        usage = {"superpowers:brainstorming": {"count": 86, "last_used": "2026-08-12"}}
+        brain.attach_skill_usage(skills, usage, today="2026-08-19")
+        self.assertEqual(skills[0]["usage"]["count"], 86)
+        self.assertEqual(skills[0]["usage"]["counter_key"], "superpowers:brainstorming")
+        self.assertEqual(skills[0]["usage"]["days_idle"], 7)
+
+    def test_plain_skill_ignores_namespaced_counter_of_same_name(self):
+        skills = [
+            {
+                "name": "test-driven-development",
+                "scope": {"level": "global", "domain": None, "project": None, "plugin": None},
+            }
+        ]
+        usage = {
+            "test-driven-development": {"count": 1, "last_used": "2026-07-04"},
+            "superpowers:test-driven-development": {"count": 6, "last_used": "2026-08-01"},
+        }
+        brain.attach_skill_usage(skills, usage, today="2026-08-19")
+        self.assertEqual(skills[0]["usage"]["count"], 1)
+        self.assertEqual(skills[0]["usage"]["counter_key"], "test-driven-development")
+
+    def test_never_used_skill_reports_zero_without_idle_days(self):
+        skills = [{"name": "unused", "scope": {"level": "global", "domain": None, "project": None, "plugin": None}}]
+        brain.attach_skill_usage(skills, {}, today="2026-08-19")
+        self.assertEqual(skills[0]["usage"]["count"], 0)
+        self.assertIsNone(skills[0]["usage"]["last_used"])
+        self.assertIsNone(skills[0]["usage"]["days_idle"])
+
+    def test_usage_summary_counts_used_and_idle_skills(self):
+        skills = [
+            {"name": "hot", "scope": {"level": "global", "domain": None, "project": None, "plugin": None}},
+            {"name": "cold", "scope": {"level": "global", "domain": None, "project": None, "plugin": None}},
+            {"name": "dead", "scope": {"level": "global", "domain": None, "project": None, "plugin": None}},
+            {"name": "kept", "scope": {"level": "archive", "domain": None, "project": None, "plugin": None}},
+        ]
+        usage = {
+            "hot": {"count": 10, "last_used": "2026-08-18"},
+            "cold": {"count": 2, "last_used": "2026-06-01"},
+        }
+        summary = brain.attach_skill_usage(skills, usage, today="2026-08-19")
+        self.assertEqual(summary["tracked"], 3)
+        self.assertEqual(summary["used"], 2)
+        self.assertEqual(summary["never_used"], 1)
+        self.assertEqual(summary["idle_over_30d"], 1)
+        self.assertEqual(summary["total_invocations"], 12)
+
+    def test_same_skill_in_several_roots_is_counted_once(self):
+        skills = [
+            {
+                "name": "review",
+                "source_path": "/a/review",
+                "scope": {"level": "global", "domain": None, "project": None, "plugin": None},
+            },
+            {
+                "name": "review",
+                "source_path": "/b/review",
+                "scope": {"level": "global", "domain": None, "project": None, "plugin": None},
+            },
+        ]
+        summary = brain.attach_skill_usage(skills, {"review": {"count": 27, "last_used": "2026-08-18"}}, today="2026-08-19")
+        self.assertEqual(summary["tracked"], 1)
+        self.assertEqual(summary["used"], 1)
+        self.assertEqual(summary["total_invocations"], 27)
+        self.assertEqual(skills[1]["usage"]["count"], 27)
+
+    def test_archived_skill_is_excluded_from_summary(self):
+        skills = [{"name": "kept", "scope": {"level": "archive", "domain": None, "project": None, "plugin": None}}]
+        summary = brain.attach_skill_usage(skills, {"kept": {"count": 5, "last_used": "2026-08-18"}}, today="2026-08-19")
+        self.assertEqual(summary["tracked"], 0)
+        self.assertEqual(skills[0]["usage"]["count"], 5)
+
+
 if __name__ == "__main__":
     unittest.main()

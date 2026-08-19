@@ -22,7 +22,7 @@ import tempfile
 import threading
 import webbrowser
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -46,6 +46,10 @@ CANVAS_PATH = REGISTRY_DIR / "views" / "agent-brain.canvas"
 AUDIT_PATH = REGISTRY_DIR / "reports" / "audit.md"
 RELATIONS_PATH = REGISTRY_DIR / "reports" / "relations.md"
 ADAPTER_MARKER = "agent-brain:routing"
+CLAUDE_STATE_PATH = Path.home() / ".claude.json"
+CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+CLAUDE_PLUGINS_DIR = Path.home() / ".claude" / "plugins"
+IDLE_DAYS_THRESHOLD = 30
 
 IGNORED_SCAN_DIRS = {
     ".git",
@@ -157,7 +161,7 @@ def first_paragraph(value: str, limit: int = 220) -> str:
     return compact[: limit - 1].rstrip() + "…"
 
 
-def parse_skill_metadata(skill_file: Path, fallback_name: str) -> Dict[str, str]:
+def parse_skill_metadata(skill_file: Path, fallback_name: str) -> Dict[str, Any]:
     """Read only frontmatter/name/description, never the full skill body."""
 
     try:
@@ -168,10 +172,11 @@ def parse_skill_metadata(skill_file: Path, fallback_name: str) -> Dict[str, str]
                     break
                 lines.append(line.rstrip("\n"))
     except OSError:
-        return {"name": fallback_name, "description": ""}
+        return {"name": fallback_name, "description": "", "model_invocable": True}
 
     name = fallback_name
     description = ""
+    model_invocable = True
     if lines and lines[0].strip() == "---":
         frontmatter: List[str] = []
         for line in lines[1:]:
@@ -185,6 +190,11 @@ def parse_skill_metadata(skill_file: Path, fallback_name: str) -> Dict[str, str]
             name_match = re.match(r"^name:\s*[\"']?(.*?)[\"']?\s*$", line)
             if name_match:
                 name = name_match.group(1).strip() or fallback_name
+                collecting_description = False
+                continue
+            invocation_match = re.match(r"^disable-model-invocation:\s*(\S+)\s*$", line)
+            if invocation_match:
+                model_invocable = invocation_match.group(1).strip("\"'").lower() != "true"
                 collecting_description = False
                 continue
             description_match = re.match(r"^description:\s*(.*)$", line)
@@ -201,7 +211,7 @@ def parse_skill_metadata(skill_file: Path, fallback_name: str) -> Dict[str, str]
                     description_lines.append(line.strip())
         description = first_paragraph(" ".join(description_lines))
 
-    return {"name": name, "description": description}
+    return {"name": name, "description": description, "model_invocable": model_invocable}
 
 
 def package_fingerprint(package_dir: Path) -> str:
@@ -487,16 +497,124 @@ def plugin_identity(source: Path) -> Optional[str]:
         cache_index = parts.index("cache")
     except ValueError:
         return None
-    if ".codex" not in parts[:cache_index]:
-        return None
+    head = parts[:cache_index]
     tail = parts[cache_index + 1 :]
+    if ".claude" not in head and ".codex" not in head:
+        return None
     if not tail:
         return "unknown"
+    if ".claude" in head:
+        # cache/<marketplace>/<plugin>/<version>/skills/<name>
+        return tail[1] if len(tail) >= 2 else tail[0]
     if len(tail) >= 2 and re.fullmatch(r"\d+(?:\.\d+)*(?:-[\w.-]+)?", tail[1]):
         return tail[0]
     if len(tail) >= 2:
         return f"{tail[0]}.{tail[1]}"
     return tail[0]
+
+
+def plugin_skill_roots(plugins_dir: Optional[Path] = None) -> List[Dict[str, str]]:
+    """Skill roots of the Claude Code plugins installed for this user."""
+
+    directory = plugins_dir if plugins_dir is not None else CLAUDE_PLUGINS_DIR
+    try:
+        registry = read_json(directory / "installed_plugins.json").get("plugins")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(registry, dict):
+        return []
+    roots: List[Dict[str, str]] = []
+    seen: set = set()
+    for identifier, installs in registry.items():
+        if not isinstance(installs, list):
+            continue
+        for install in installs:
+            if not isinstance(install, dict) or install.get("scope") != "user":
+                continue
+            install_path = install.get("installPath")
+            if not isinstance(install_path, str):
+                continue
+            install_root = expand_path(install_path)
+            path = install_root / "skills"
+            if not path.is_dir() or str(path) in seen:
+                continue
+            seen.add(str(path))
+            spec = {
+                "path": str(path),
+                "runtime": "claude",
+                "kind": "mount",
+                "plugin": identifier.split("@")[0],
+            }
+            declared = plugin_declared_skills(install_root)
+            if declared is not None:
+                spec["declared"] = declared
+            roots.append(spec)
+    return roots
+
+
+def plugin_declared_skills(install_root: Path) -> Optional[List[str]]:
+    """Skill directories a plugin manifest exports, or None when it exports all."""
+
+    try:
+        declared = read_json(install_root / ".claude-plugin" / "plugin.json").get("skills")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(declared, list):
+        return None
+    return [str(install_root / str(item).lstrip("./")) for item in declared if isinstance(item, str)]
+
+
+def scan_config() -> Dict[str, Any]:
+    """Registry config extended with the skill roots of installed plugins.
+
+    Plugin roots are discovered from the runtime rather than stored in the
+    manifest: their paths carry a version and change on every plugin update.
+    """
+
+    config = read_json(CONFIG_PATH) if CONFIG_PATH.is_file() else {}
+    roots = list(config.get("skill_roots", []))
+    known = {
+        str(safe_resolve(expand_path(item["path"])))
+        for item in roots
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    for spec in plugin_skill_roots():
+        resolved = str(safe_resolve(expand_path(spec["path"])))
+        if resolved in known:
+            continue
+        known.add(resolved)
+        roots.append(spec)
+    config["skill_roots"] = roots
+    return config
+
+
+def read_enabled_plugins(settings_path: Optional[Path] = None) -> List[str]:
+    """Plugins the runtime currently loads, by plugin name without marketplace."""
+
+    path = settings_path if settings_path is not None else CLAUDE_SETTINGS_PATH
+    try:
+        enabled = read_json(path).get("enabledPlugins")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(enabled, dict):
+        return []
+    return sorted({key.split("@")[0] for key, value in enabled.items() if value})
+
+
+def read_listing_limits(settings_path: Optional[Path] = None) -> Dict[str, Optional[float]]:
+    """Caps the runtime applies to the skill listing it puts in the prompt."""
+
+    path = settings_path if settings_path is not None else CLAUDE_SETTINGS_PATH
+    try:
+        settings = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        settings = {}
+    max_chars = settings.get("skillListingMaxDescChars")
+    fraction = settings.get("skillListingBudgetFraction")
+    return {
+        "max_desc_chars": int(max_chars) if isinstance(max_chars, (int, float)) else None,
+        "budget_fraction": float(fraction) if isinstance(fraction, (int, float)) else None,
+    }
 
 
 def find_project_for_path(source: Path, projects: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -627,7 +745,10 @@ def collect_skill_occurrences(
             if not root_spec.get("optional", False):
                 broken.append({"kind": "missing_skill_root", "path": str(root)})
             continue
+        declared = root_spec.get("declared")
         for mount_dir, skill_file in walk_skill_files(root):
+            if declared is not None and str(mount_dir) not in declared:
+                continue
             mount_key = (str(mount_dir), root_spec["runtime"])
             if mount_key in seen_mount_runtime:
                 continue
@@ -644,6 +765,7 @@ def collect_skill_occurrences(
                     "logical_name": metadata["name"],
                     "mount_name": mount_dir.name,
                     "description": metadata["description"],
+                    "model_invocable": metadata["model_invocable"],
                     "mount_path": str(mount_dir),
                     "source_path": str(source_dir),
                     "package_fingerprint": package_fingerprint(source_dir),
@@ -696,6 +818,7 @@ def merge_skills(
                 "name": name,
                 "mount_names": sorted({item["mount_name"] for item in mounts}),
                 "description": preferred["description"],
+                "model_invocable": preferred.get("model_invocable", True),
                 "scope": scope,
                 "source_path": source_path,
                 "alternate_sources": sorted({item["source_path"] for item in mounts if item["source_path"] != source_path}),
@@ -809,13 +932,84 @@ def instruction_inventory(
     return sorted(inventory, key=lambda item: item["path"])
 
 
+def read_skill_usage(state_path: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
+    """Read the skill invocation counters Claude Code keeps in ~/.claude.json."""
+
+    path = state_path if state_path is not None else CLAUDE_STATE_PATH
+    try:
+        raw = read_json(path).get("skillUsage")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    usage: Dict[str, Dict[str, Any]] = {}
+    for key, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        timestamp = entry.get("lastUsedAt")
+        last_used = None
+        if isinstance(timestamp, (int, float)):
+            last_used = datetime.fromtimestamp(timestamp / 1000, timezone.utc).date().isoformat()
+        usage[key] = {"count": int(entry.get("usageCount") or 0), "last_used": last_used}
+    return usage
+
+
+def attach_skill_usage(
+    skills: Sequence[Dict[str, Any]],
+    usage: Dict[str, Dict[str, Any]],
+    today: Optional[str] = None,
+) -> Dict[str, int]:
+    """Attach invocation counters to every skill and summarise the result.
+
+    Counters are keyed by the name the runtime lists, so a plugin skill is
+    looked up as ``plugin:name`` first and only then by its bare name. The
+    summary counts each listed name once, because the same skill mounted in
+    several roots is still a single entry for the runtime. Archived sources
+    still receive their counters but stay out of the summary.
+    """
+
+    current = date.fromisoformat(today) if today else datetime.now(timezone.utc).date()
+    summary = {"tracked": 0, "used": 0, "never_used": 0, "idle_over_30d": 0, "total_invocations": 0}
+    counted: set = set()
+    for skill in skills:
+        plugin = skill["scope"].get("plugin")
+        candidates = [f"{plugin}:{skill['name']}"] if plugin else []
+        candidates.append(skill["name"])
+        counter_key = next((key for key in candidates if key in usage), None)
+        entry = usage[counter_key] if counter_key else None
+        last_used = entry["last_used"] if entry else None
+        skill["usage"] = {
+            "count": entry["count"] if entry else 0,
+            "last_used": last_used,
+            "days_idle": (current - date.fromisoformat(last_used)).days if last_used else None,
+            "counter_key": counter_key,
+        }
+        if skill["scope"]["level"] == "archive":
+            continue
+        listed_name = counter_key or candidates[0]
+        if listed_name in counted:
+            continue
+        counted.add(listed_name)
+        summary["tracked"] += 1
+        summary["total_invocations"] += skill["usage"]["count"]
+        if not skill["usage"]["count"]:
+            summary["never_used"] += 1
+            continue
+        summary["used"] += 1
+        days_idle = skill["usage"]["days_idle"]
+        if days_idle is not None and days_idle > IDLE_DAYS_THRESHOLD:
+            summary["idle_over_30d"] += 1
+    return summary
+
+
 def build_inventory() -> Dict[str, Any]:
-    config = read_json(CONFIG_PATH)
+    config = scan_config()
     domains = load_domains()
     projects = load_projects()
     workflows = load_workflows()
     occurrences, broken = collect_skill_occurrences(config, projects)
     skills, collisions = merge_skills(occurrences, config, projects)
+    usage_summary = attach_skill_usage(skills, read_skill_usage())
     instructions = instruction_inventory(config, projects)
 
     for project in projects:
@@ -848,7 +1042,8 @@ def build_inventory() -> Dict[str, Any]:
             "default_domain": config.get("default_domain", "meta.agent-system"),
             "domain_path_rules": config.get("domain_path_rules", []),
             "skill_scope_rules": config.get("skill_scope_rules", []),
-            "active_plugins": config.get("active_plugins", []),
+            "active_plugins": config.get("active_plugins") or read_enabled_plugins(),
+            "listing_limits": read_listing_limits(),
         },
         "source_snapshot": source_snapshot(config, projects),
         "domains": domains,
@@ -869,6 +1064,7 @@ def build_inventory() -> Dict[str, Any]:
             "project_count": len(projects),
             "domain_count": len(domains),
             "workflow_count": len(workflows),
+            "usage": usage_summary,
         },
     }
 
@@ -1391,7 +1587,7 @@ def source_snapshot(
         except OSError:
             continue
     if config is None:
-        config = read_json(CONFIG_PATH) if CONFIG_PATH.is_file() else {}
+        config = scan_config()
     if projects is None:
         projects = load_projects() if CONFIG_PATH.is_file() else []
     roots = [expand_path(item["path"]) for item in config.get("skill_roots", []) if isinstance(item, dict) and isinstance(item.get("path"), str)]

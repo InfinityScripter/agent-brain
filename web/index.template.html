@@ -307,6 +307,8 @@
           <article class="metric"><div class="eyebrow">Excluded by scope</div><div class="metric-value" id="metricExcluded">—</div><div class="metric-note">not considered for automatic selection</div></article>
           <article class="metric"><div class="eyebrow">Registered projects</div><div class="metric-value" id="metricProjects">—</div><div class="metric-note" id="metricProjectsNote"></div></article>
           <article class="metric"><div class="eyebrow">Name collisions</div><div class="metric-value" id="metricCollisions">—</div><div class="metric-note" id="metricCollisionNote">canonical source selected</div></article>
+          <article class="metric"><div class="eyebrow">Never used</div><div class="metric-value" id="metricNeverUsed">—</div><div class="metric-note" id="metricNeverUsedNote"></div></article>
+          <article class="metric"><div class="eyebrow">Listing cost</div><div class="metric-value" id="metricListingCost">—</div><div class="metric-note" id="metricListingCostNote"></div></article>
         </div>
 
         <article class="path-card">
@@ -349,8 +351,9 @@
         <div class="inventory-tools">
           <input class="search-input" id="inventorySearch" type="search" placeholder="Search by ID, name, or path…" aria-label="Search inventory">
           <select class="search-input" id="scopeFilter" aria-label="Scope filter"><option value="all">All scopes</option><option value="global">Global</option><option value="domain">Domain</option><option value="project">Project</option><option value="plugin">Plugin</option><option value="archive">Archive</option></select>
+          <select class="search-input" id="usageFilter" aria-label="Usage filter"><option value="all">Any usage</option><option value="never">Never used</option><option value="idle">Idle over 30 days</option><option value="active">Used recently</option><option value="hidden">Hidden from model</option></select>
         </div>
-        <div class="table-wrap"><table><thead><tr><th>Skill ID</th><th>Scope</th><th>Status</th><th>Runtime</th><th>Source</th></tr></thead><tbody id="inventoryRows"></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>Skill ID</th><th>Scope</th><th>Status</th><th>Calls</th><th>Last used</th><th>Source</th></tr></thead><tbody id="inventoryRows"></tbody></table></div>
       </section>
     </main>
   </div>
@@ -367,7 +370,10 @@
   <script>
     const DATA = __AGENT_BRAIN_DATA__;
     const palette = { work: '#46a7ff', personal: '#f3b64b', creative: '#e36fad', meta: '#9c83ff', project: '#45c79a', global: '#f2eddf', plugin: '#69d3c5', archive: '#687080', danger: '#ff6b5f' };
-    const state = { tab: 'overview', domain: 'meta.agent-system', project: 'agent-brain', runtime: 'all', zoom: 1, mapQuery: '', inventoryQuery: '', scope: 'all' };
+    const state = { tab: 'overview', domain: 'meta.agent-system', project: 'agent-brain', runtime: 'all', zoom: 1, mapQuery: '', inventoryQuery: '', scope: 'all', usage: 'all' };
+    const IDLE_DAYS = 30;
+    const CHARS_PER_TOKEN = 3;
+    const CONTEXT_WINDOW_TOKENS = 200000;
 
     const $ = selector => document.querySelector(selector);
     const $$ = selector => [...document.querySelectorAll(selector)];
@@ -465,6 +471,8 @@
       $('#activeSkills').innerHTML = shown.map(skill => `<button class="skill-chip" data-skill="${esc(skill.id)}">${esc(skill.id)}</button>`).join('') || '<div class="empty">No active skills for this context.</div>';
       $('#activeListNote').textContent = active.length > shown.length ? `showing ${shown.length} of ${active.length}` : `${active.length} total`;
       $$('#activeSkills [data-skill]').forEach(button => button.addEventListener('click', () => openSkill(button.dataset.skill)));
+
+      renderUsageMetrics(active);
 
       const counts = {};
       DATA.skills.forEach(skill => counts[skill.scope.level] = (counts[skill.scope.level] || 0) + 1);
@@ -566,15 +574,69 @@
       }));
     }
 
+    function listedSkills(skills) {
+      // The listing budget is a Claude Code setting, so Codex-only mounts never count.
+      return skills.filter(skill => skill.model_invocable !== false && skill.runtimes.includes('claude'));
+    }
+
+    function listingTokens(skills) {
+      const cap = DATA.config?.listing_limits?.max_desc_chars;
+      const chars = listedSkills(skills).reduce((total, skill) => {
+        const description = skill.description || '';
+        return total + Math.min(description.length, cap || description.length) + skill.name.length + 12;
+      }, 0);
+      return Math.round(chars / CHARS_PER_TOKEN);
+    }
+
+    function renderUsageMetrics(active) {
+      const listed = listedSkills(active);
+      const neverUsed = listed.filter(skill => !usageOf(skill).count);
+      $('#metricNeverUsed').textContent = neverUsed.length;
+      $('#metricNeverUsedNote').textContent = `of ${listed.length} listed to Claude · ${listingTokens(neverUsed).toLocaleString('en-US')} tokens`;
+
+      const cost = listingTokens(active);
+      const fraction = DATA.config?.listing_limits?.budget_fraction;
+      const budget = fraction ? Math.round(CONTEXT_WINDOW_TOKENS * fraction) : null;
+      $('#metricListingCost').textContent = `~${cost.toLocaleString('en-US')}`;
+      $('#metricListingCostNote').textContent = budget
+        ? `tokens every session · budget ${budget.toLocaleString('en-US')} (${cost > budget ? 'over by ' + Math.round((cost / budget - 1) * 100) + '%' : 'within limit'})`
+        : 'tokens every session';
+    }
+
+    function usageOf(skill) { return skill.usage || {count: 0, last_used: null, days_idle: null}; }
+
+    function matchesUsage(skill) {
+      const usage = usageOf(skill);
+      if (state.usage === 'never') return !usage.count;
+      if (state.usage === 'idle') return Boolean(usage.count) && usage.days_idle > IDLE_DAYS;
+      if (state.usage === 'active') return Boolean(usage.count) && usage.days_idle <= IDLE_DAYS;
+      if (state.usage === 'hidden') return skill.model_invocable === false;
+      return true;
+    }
+
+    function usageCell(skill) {
+      const usage = usageOf(skill);
+      if (!usage.count) return '<span class="badge excluded">never</span>';
+      return `<strong>${usage.count}</strong>`;
+    }
+
+    function lastUsedCell(skill) {
+      const usage = usageOf(skill);
+      if (!usage.last_used) return '<span class="card-note">—</span>';
+      const suffix = usage.days_idle > IDLE_DAYS ? ` <span class="badge excluded">${usage.days_idle}d</span>` : ` <span class="card-note">${usage.days_idle}d</span>`;
+      return `<span class="mono">${esc(usage.last_used)}</span>${suffix}`;
+    }
+
     function renderInventory() {
       const query = state.inventoryQuery.trim().toLowerCase();
       const activeIds = new Set(activeSkills().map(skill => skill.id));
       const skills = DATA.skills.filter(skill => {
         if (state.scope !== 'all' && skill.scope.level !== state.scope) return false;
         if (!runtimeVisible(skill)) return false;
+        if (!matchesUsage(skill)) return false;
         return !query || `${skill.id} ${skill.name} ${skill.source_path}`.toLowerCase().includes(query);
-      });
-      $('#inventoryRows').innerHTML = skills.map(skill => `<tr data-skill="${esc(skill.id)}"><td><strong>${esc(skill.id)}</strong><br><span class="mono">${esc(skill.name)}</span></td><td><span class="badge">${esc(skill.scope.level)}</span></td><td><span class="badge ${activeIds.has(skill.id) ? 'active' : 'excluded'}">${activeIds.has(skill.id) ? 'active' : 'excluded'}</span></td><td class="mono">${skill.runtimes.map(esc).join(', ')}</td><td class="mono">${esc(skill.source_path)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">Nothing found.</td></tr>';
+      }).sort((a, b) => usageOf(b).count - usageOf(a).count);
+      $('#inventoryRows').innerHTML = skills.map(skill => `<tr data-skill="${esc(skill.id)}"><td><strong>${esc(skill.id)}</strong><br><span class="mono">${esc(skill.name)}</span></td><td><span class="badge">${esc(skill.scope.level)}</span></td><td><span class="badge ${activeIds.has(skill.id) ? 'active' : 'excluded'}">${activeIds.has(skill.id) ? 'active' : 'excluded'}</span>${skill.model_invocable === false ? ' <span class="badge">slash only</span>' : ''}</td><td>${usageCell(skill)}</td><td>${lastUsedCell(skill)}</td><td class="mono">${esc(skill.source_path)}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">Nothing found.</td></tr>';
       $$('#inventoryRows tr[data-skill]').forEach(row => row.addEventListener('click', () => openSkill(row.dataset.skill)));
     }
 
@@ -613,6 +675,7 @@
       $('#mapSearch').addEventListener('input', event => { state.mapQuery = event.target.value; renderMap(); });
       $('#inventorySearch').addEventListener('input', event => { state.inventoryQuery = event.target.value; renderInventory(); });
       $('#scopeFilter').addEventListener('change', event => { state.scope = event.target.value; renderInventory(); });
+      $('#usageFilter').addEventListener('change', event => { state.usage = event.target.value; renderInventory(); });
       $('#zoomIn').addEventListener('click', () => { state.zoom = Math.min(1.3, state.zoom + .1); renderMap(); });
       $('#zoomOut').addEventListener('click', () => { state.zoom = Math.max(.55, state.zoom - .1); renderMap(); });
       $('#drawerClose').addEventListener('click', closeDrawer); $('#backdrop').addEventListener('click', closeDrawer);
