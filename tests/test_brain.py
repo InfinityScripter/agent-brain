@@ -551,6 +551,94 @@ class ClaudePluginTests(unittest.TestCase):
             self.assertEqual(brain.read_enabled_plugins(path), ["superpowers"])
 
 
+class ListingOverrideTests(unittest.TestCase):
+    """Turning registry scope into skillOverrides the runtime understands."""
+
+    def skill(self, name, level, **scope):
+        return {
+            "id": f"{level}.{name}",
+            "name": name,
+            "description": "d",
+            "runtimes": scope.pop("runtimes", ["claude"]),
+            "model_invocable": scope.pop("model_invocable", True),
+            "scope": {"level": level, "domain": None, "project": None, "plugin": None, **scope},
+        }
+
+    def overrides(self, skills, context):
+        return brain.skill_listing_overrides({"skills": skills}, context)
+
+    def test_skill_outside_context_is_hidden_from_model(self):
+        skills = [self.skill("deploy", "domain", domain="work.company")]
+        context = {"domain": "personal", "project": None}
+        self.assertEqual(self.overrides(skills, context), {"deploy": "user-invocable-only"})
+
+    def test_active_skill_is_left_alone(self):
+        skills = [self.skill("deploy", "domain", domain="work.company")]
+        context = {"domain": "work.company", "project": None}
+        self.assertEqual(self.overrides(skills, context), {})
+
+    def test_name_shared_with_an_active_skill_is_never_hidden(self):
+        skills = [
+            self.skill("review", "domain", domain="work.company"),
+            self.skill("review", "global"),
+        ]
+        context = {"domain": "personal", "project": None}
+        self.assertEqual(self.overrides(skills, context), {})
+
+    def test_plugin_skill_moved_into_a_domain_keeps_its_prefix(self):
+        skill = self.skill("babysit", "domain", domain="work.company")
+        skill["plugin_source"] = "claude-mem"
+        context = {"domain": "personal", "project": None, "active_plugins": ["claude-mem"]}
+        self.assertEqual(self.overrides([skill], context), {"claude-mem:babysit": "user-invocable-only"})
+
+    def test_plugin_scoped_skill_is_never_hidden_while_its_plugin_runs(self):
+        skills = [self.skill("babysit", "plugin", plugin="claude-mem")]
+        context = {"domain": "personal", "project": None, "active_plugins": ["claude-mem"]}
+        self.assertEqual(self.overrides(skills, context), {})
+
+    def test_enabled_plugin_skill_stays_visible(self):
+        skills = [self.skill("brainstorming", "plugin", plugin="superpowers")]
+        context = {"domain": "personal", "project": None, "active_plugins": ["superpowers"]}
+        self.assertEqual(self.overrides(skills, context), {})
+
+    def test_archived_and_non_claude_skills_are_ignored(self):
+        skills = [
+            self.skill("old", "archive"),
+            self.skill("codex-only", "domain", domain="work.company", runtimes=["codex"]),
+            self.skill("hidden", "domain", domain="work.company", model_invocable=False),
+            self.skill("off-plugin", "plugin", plugin="ponytail"),
+            dict(self.skill("off-plugin-domain", "domain", domain="work.company"), plugin_source="ponytail"),
+        ]
+        context = {"domain": "personal", "project": None}
+        self.assertEqual(self.overrides(skills, context), {})
+
+    def test_write_replaces_only_the_overrides_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(json.dumps({"model": "opus", "skillOverrides": {"stale": "off"}}), encoding="utf-8")
+            brain.write_skill_overrides({"fresh": "user-invocable-only"}, path)
+            written = json.loads(path.read_text(encoding="utf-8"))
+            backup = json.loads((path.parent / "settings.json.brain-backup").read_text(encoding="utf-8"))
+        self.assertEqual(written["model"], "opus")
+        self.assertEqual(written["skillOverrides"], {"fresh": "user-invocable-only"})
+        self.assertEqual(backup["skillOverrides"], {"stale": "off"})
+
+    def test_empty_overrides_drop_the_key_entirely(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(json.dumps({"model": "opus", "skillOverrides": {"stale": "off"}}), encoding="utf-8")
+            brain.write_skill_overrides({}, path)
+            written = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotIn("skillOverrides", written)
+        self.assertEqual(written["model"], "opus")
+
+    def test_missing_settings_file_is_created(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            brain.write_skill_overrides({"x": "user-invocable-only"}, path)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"skillOverrides": {"x": "user-invocable-only"}})
+
+
 class ModelVisibilityTests(unittest.TestCase):
     """Skills hidden from the model still cost nothing in the listing."""
 

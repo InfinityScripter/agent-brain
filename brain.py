@@ -601,6 +601,64 @@ def read_enabled_plugins(settings_path: Optional[Path] = None) -> List[str]:
     return sorted({key.split("@")[0] for key, value in enabled.items() if value})
 
 
+def listing_name(skill: Dict[str, Any]) -> str:
+    """The name the runtime lists a skill under, plugin prefix included.
+
+    The prefix follows the source a skill was loaded from, not the scope the
+    registry assigned it: moving a plugin skill into a domain does not rename
+    it for the runtime.
+    """
+
+    plugin = skill.get("plugin_source") or skill["scope"].get("plugin")
+    return f"{plugin}:{skill['name']}" if plugin else skill["name"]
+
+
+def skill_listing_overrides(inventory: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, str]:
+    """Hide out-of-context skills from the model while keeping /name working.
+
+    Overrides are keyed by listed name, so a name shared with a skill that is
+    active here stays untouched — hiding it would take the active one down too.
+    """
+
+    installed_plugins = set(context.get("active_plugins", []))
+    listed: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for skill in inventory["skills"]:
+        scope = skill["scope"]
+        if scope["level"] == "archive" or not skill.get("model_invocable", True):
+            continue
+        if "claude" not in skill["runtimes"]:
+            continue
+        # A disabled plugin is already absent from the listing; overriding it is noise.
+        plugin = skill.get("plugin_source") or scope.get("plugin")
+        if plugin and plugin not in installed_plugins:
+            continue
+        listed[listing_name(skill)].append(skill)
+
+    return {
+        name: "user-invocable-only"
+        for name, candidates in sorted(listed.items())
+        if not any(skill_is_active(skill, context) for skill in candidates)
+    }
+
+
+def write_skill_overrides(overrides: Dict[str, str], settings_path: Optional[Path] = None) -> Path:
+    """Replace the skillOverrides block of the runtime settings, backing it up."""
+
+    path = settings_path if settings_path is not None else CLAUDE_SETTINGS_PATH
+    try:
+        settings = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        settings = {}
+    else:
+        write_text_atomic(path.with_name(path.name + ".brain-backup"), json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
+    if overrides:
+        settings["skillOverrides"] = overrides
+    else:
+        settings.pop("skillOverrides", None)
+    write_text_atomic(path, json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
+    return path
+
+
 def read_listing_limits(settings_path: Optional[Path] = None) -> Dict[str, Optional[float]]:
     """Caps the runtime applies to the skill listing it puts in the prompt."""
 
@@ -766,6 +824,7 @@ def collect_skill_occurrences(
                     "mount_name": mount_dir.name,
                     "description": metadata["description"],
                     "model_invocable": metadata["model_invocable"],
+                    "plugin_source": plugin_identity(source_dir),
                     "mount_path": str(mount_dir),
                     "source_path": str(source_dir),
                     "package_fingerprint": package_fingerprint(source_dir),
@@ -819,6 +878,7 @@ def merge_skills(
                 "mount_names": sorted({item["mount_name"] for item in mounts}),
                 "description": preferred["description"],
                 "model_invocable": preferred.get("model_invocable", True),
+                "plugin_source": preferred.get("plugin_source"),
                 "scope": scope,
                 "source_path": source_path,
                 "alternate_sources": sorted({item["source_path"] for item in mounts if item["source_path"] != source_path}),
@@ -2267,17 +2327,39 @@ def command_validate(_: argparse.Namespace) -> int:
     return 0
 
 
+def report_listing_overrides(inventory: Dict[str, Any], overrides: Dict[str, str], applied: bool) -> None:
+    limits = inventory_config(inventory).get("listing_limits") or {}
+    cap = limits.get("max_desc_chars")
+    hidden = [skill for skill in inventory["skills"] if listing_name(skill) in overrides]
+    chars = sum(min(len(skill["description"]), cap or len(skill["description"])) + len(skill["name"]) + 12 for skill in hidden)
+    verb = "Hidden from the model" if applied else "Would hide"
+    print(f"{verb}: {len(overrides)} skills, about {round(chars / 3)} tokens per session. They stay available as /name.")
+
+
 def command_use(args: argparse.Namespace) -> int:
     if args.domain == "auto":
         if STATE_PATH.exists():
             STATE_PATH.unlink()
         print("Explicit domain override cleared; context will be resolved automatically.")
+        if args.skip_overrides or args.dry_run:
+            return 0
+        write_skill_overrides({})
+        print("Skill listing restored: every skill is visible to the model again.")
         return 0
     domain_ids = {item["id"] for item in load_domains()}
     if args.domain not in domain_ids:
         print(f"Unknown domain: {args.domain}", file=sys.stderr)
         print("Known domains: " + ", ".join(sorted(domain_ids)), file=sys.stderr)
         return 2
+
+    inventory = load_or_build_inventory()
+    overrides = skill_listing_overrides(inventory, resolve_context(Path(args.cwd), inventory, explicit_domain=args.domain))
+    if args.dry_run:
+        report_listing_overrides(inventory, overrides, applied=False)
+        for name in sorted(overrides):
+            print(f"  {name}")
+        return 0
+
     write_json(
         STATE_PATH,
         {
@@ -2287,6 +2369,10 @@ def command_use(args: argparse.Namespace) -> int:
         },
     )
     print(f"Default domain override set to {args.domain}.")
+    if args.skip_overrides:
+        return 0
+    write_skill_overrides(overrides)
+    report_listing_overrides(inventory, overrides, applied=True)
     return 0
 
 
@@ -2455,8 +2541,11 @@ def create_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--json", action="store_true")
     validate_parser.set_defaults(func=command_validate)
 
-    use_parser = subparsers.add_parser("use", help="set a default domain override")
+    use_parser = subparsers.add_parser("use", help="set a default domain override and hide out-of-context skills")
     use_parser.add_argument("domain", help="domain ID or 'auto'")
+    use_parser.add_argument("--cwd", default=str(Path.cwd()), help="workspace path used to resolve the project")
+    use_parser.add_argument("--dry-run", action="store_true", help="list what would be hidden, change nothing")
+    use_parser.add_argument("--skip-overrides", action="store_true", help="switch domain without touching runtime settings")
     use_parser.set_defaults(func=command_use)
 
     hook_parser = subparsers.add_parser("hook", help="emit UserPromptSubmit context")
