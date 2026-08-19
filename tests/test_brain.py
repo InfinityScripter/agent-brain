@@ -639,6 +639,74 @@ class ListingOverrideTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"skillOverrides": {"x": "user-invocable-only"}})
 
 
+class SkillBundleTests(unittest.TestCase):
+    """Named blocks that group related skills for reading the registry."""
+
+    RULES = [
+        {"id": "orchestrator", "title": "Оркестратор", "names": ["ququ-orchestrator-code-style", "tariff-editor"]},
+        {"id": "ququ", "title": "QuQu", "name_prefix": "ququ-"},
+        {"id": "arcanum", "title": "Аркадия", "names": ["arc", "arcanum-go"]},
+    ]
+
+    def skill(self, name, plugin=None, source="/skills/x"):
+        return {
+            "name": name,
+            "source_path": source,
+            "scope": {"level": "plugin" if plugin else "global", "domain": None, "project": None, "plugin": plugin},
+            "plugin_source": plugin,
+        }
+
+    def test_prefix_rule_assigns_bundle(self):
+        self.assertEqual(brain.classify_bundle(self.skill("ququ-solve"), self.RULES), "ququ")
+
+    def test_explicit_name_wins_over_later_prefix_rule(self):
+        self.assertEqual(brain.classify_bundle(self.skill("ququ-orchestrator-code-style"), self.RULES), "orchestrator")
+
+    def test_name_list_rule_assigns_bundle(self):
+        self.assertEqual(brain.classify_bundle(self.skill("arcanum-go"), self.RULES), "arcanum")
+
+    def test_plugin_skill_falls_back_to_its_plugin(self):
+        self.assertEqual(brain.classify_bundle(self.skill("babysit", plugin="claude-mem"), self.RULES), "claude-mem")
+
+    def test_unmatched_skill_has_no_bundle(self):
+        self.assertIsNone(brain.classify_bundle(self.skill("humanizer"), self.RULES))
+
+    def test_source_pattern_rule_assigns_bundle(self):
+        rules = [{"id": "tef", "title": "TEF", "source_pattern": "/junk/talalaev-m/"}]
+        skill = self.skill("whatever", source="/home/u/junk/talalaev-m/ai/skills/whatever")
+        self.assertEqual(brain.classify_bundle(skill, rules), "tef")
+
+    def test_summary_counts_skills_and_idle_ones_per_bundle(self):
+        skills = [
+            dict(self.skill("ququ-solve"), bundle="ququ", description="d", runtimes=["claude"], model_invocable=True,
+                 usage={"count": 3, "last_used": "2026-08-18", "days_idle": 1, "counter_key": "ququ-solve"}),
+            dict(self.skill("ququ-design"), bundle="ququ", description="d", runtimes=["claude"], model_invocable=True,
+                 usage={"count": 0, "last_used": None, "days_idle": None, "counter_key": None}),
+            dict(self.skill("humanizer"), bundle=None, description="d", runtimes=["claude"], model_invocable=True,
+                 usage={"count": 5, "last_used": "2026-08-19", "days_idle": 0, "counter_key": "humanizer"}),
+        ]
+        summary = brain.bundle_summary(skills, [{"id": "ququ", "title": "QuQu"}])
+        self.assertEqual(summary[0]["id"], "ququ")
+        self.assertEqual(summary[0]["title"], "QuQu")
+        self.assertEqual(summary[0]["skill_count"], 2)
+        self.assertEqual(summary[0]["never_used"], 1)
+        self.assertEqual(summary[0]["invocations"], 3)
+
+    def test_summary_counts_a_skill_mounted_twice_once(self):
+        def member(source):
+            return dict(self.skill("ququ-solve", source=source), bundle="ququ", description="d",
+                        runtimes=["claude"], model_invocable=True,
+                        usage={"count": 3, "last_used": "2026-08-18", "days_idle": 1, "counter_key": "ququ-solve"})
+
+        summary = brain.bundle_summary([member("/a/x"), member("/b/x")], [{"id": "ququ", "title": "QuQu"}])
+        self.assertEqual(summary[0]["skill_count"], 1)
+        self.assertEqual(summary[0]["invocations"], 3)
+
+    def test_summary_skips_bundles_without_skills(self):
+        summary = brain.bundle_summary([], [{"id": "ququ", "title": "QuQu"}])
+        self.assertEqual(summary, [])
+
+
 class UsageReportTests(unittest.TestCase):
     """The audit report carries the usage numbers, not just the inventory."""
 
@@ -664,6 +732,22 @@ class UsageReportTests(unittest.TestCase):
         self.assertIn("Never invoked: **1**", report)
         self.assertIn("Idle over 30 days: **1**", report)
         self.assertIn("Total invocations: **12**", report)
+
+    def test_audit_lists_blocks_when_the_registry_has_them(self):
+        inventory = {
+            "generated_at": "2026-08-19T00:00:00+00:00",
+            "instructions": [], "collisions": [], "broken_sources": [], "projects": [],
+            "domains": [], "skills": [], "config": {},
+            "bundles": [{"id": "ququ", "title": "QuQu", "skill_count": 23, "never_used": 14, "invocations": 36}],
+            "stats": {
+                "skill_sources": 1, "skill_mounts": 1, "domain_count": 1, "project_count": 0,
+                "workflow_count": 0, "collision_count": 0, "unresolved_collision_count": 0,
+                "broken_count": 0,
+            },
+        }
+        report = brain.generate_audit(inventory)
+        self.assertIn("## Blocks", report)
+        self.assertIn("| QuQu | 23 | 14 | 36 |", report)
 
     def test_audit_survives_a_registry_without_usage_stats(self):
         inventory = {

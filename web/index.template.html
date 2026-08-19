@@ -323,6 +323,10 @@
             <div class="skill-chips" id="activeSkills"></div>
           </article>
           <article class="card">
+            <div class="card-header"><h2>Blocks</h2><span class="card-note" id="bundleNote">grouped skills</span></div>
+            <div class="scope-list" id="bundleList"></div>
+          </article>
+          <article class="card">
             <div class="card-header"><h2>Scope balance</h2><span class="card-note">whole registry</span></div>
             <div class="scope-list" id="scopeList"></div>
           </article>
@@ -352,6 +356,7 @@
           <input class="search-input" id="inventorySearch" type="search" placeholder="Search by ID, name, or path…" aria-label="Search inventory">
           <select class="search-input" id="scopeFilter" aria-label="Scope filter"><option value="all">All scopes</option><option value="global">Global</option><option value="domain">Domain</option><option value="project">Project</option><option value="plugin">Plugin</option><option value="archive">Archive</option></select>
           <select class="search-input" id="usageFilter" aria-label="Usage filter"><option value="all">Any usage</option><option value="never">Never used</option><option value="idle">Idle over 30 days</option><option value="active">Used recently</option><option value="hidden">Hidden from model</option></select>
+          <select class="search-input" id="bundleFilter" aria-label="Block filter"><option value="all">All blocks</option></select>
         </div>
         <div class="table-wrap"><table><thead><tr><th>Skill ID</th><th>Scope</th><th>Status</th><th>Calls</th><th>Last used</th><th>Source</th></tr></thead><tbody id="inventoryRows"></tbody></table></div>
       </section>
@@ -370,7 +375,7 @@
   <script>
     const DATA = __AGENT_BRAIN_DATA__;
     const palette = { work: '#46a7ff', personal: '#f3b64b', creative: '#e36fad', meta: '#9c83ff', project: '#45c79a', global: '#f2eddf', plugin: '#69d3c5', archive: '#687080', danger: '#ff6b5f' };
-    const state = { tab: 'overview', domain: 'meta.agent-system', project: 'agent-brain', runtime: 'all', zoom: 1, mapQuery: '', inventoryQuery: '', scope: 'all', usage: 'all' };
+    const state = { tab: 'overview', domain: 'meta.agent-system', project: 'agent-brain', runtime: 'all', zoom: 1, mapQuery: '', inventoryQuery: '', scope: 'all', usage: 'all', bundle: 'all' };
     const IDLE_DAYS = 30;
     const CHARS_PER_TOKEN = 3;
     const CONTEXT_WINDOW_TOKENS = 200000;
@@ -473,6 +478,7 @@
       $$('#activeSkills [data-skill]').forEach(button => button.addEventListener('click', () => openSkill(button.dataset.skill)));
 
       renderUsageMetrics(active);
+      renderBundles(visible);
 
       const counts = {};
       DATA.skills.forEach(skill => counts[skill.scope.level] = (counts[skill.scope.level] || 0) + 1);
@@ -603,6 +609,35 @@
         : 'tokens every session';
     }
 
+    function listingName(skill) {
+      const plugin = skill.plugin_source || skill.scope.plugin;
+      return plugin ? `${plugin}:${skill.name}` : skill.name;
+    }
+
+    function bundleTitle(id) {
+      return (DATA.bundles || []).find(bundle => bundle.id === id)?.title || id;
+    }
+
+    function renderBundles(visible) {
+      const counts = {};
+      const dead = {};
+      const seen = new Set();
+      let ungrouped = 0;
+      // The same skill mounted in several roots is one entry for the runtime.
+      visible.forEach(skill => {
+        const key = listingName(skill);
+        if (seen.has(key)) return;
+        seen.add(key);
+        if (!skill.bundle) { ungrouped += 1; return; }
+        counts[skill.bundle] = (counts[skill.bundle] || 0) + 1;
+        if (!usageOf(skill).count) dead[skill.bundle] = (dead[skill.bundle] || 0) + 1;
+      });
+      const rows = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+      const max = Math.max(...rows.map(row => row[1]), 1);
+      $('#bundleNote').textContent = `${rows.length} blocks · ${ungrouped} ungrouped`;
+      $('#bundleList').innerHTML = rows.map(([id, count]) => `<div class="scope-row"><span>${esc(bundleTitle(id))}</span><div class="scope-bar"><i style="--width:${Math.round(count / max * 100)}%;background:${dead[id] === count ? 'var(--muted)' : 'var(--active-accent)'}"></i></div><b>${count}${dead[id] ? ` <span class="card-note">−${dead[id]}</span>` : ''}</b></div>`).join('') || '<div class="empty">No blocks configured.</div>';
+    }
+
     function usageOf(skill) { return skill.usage || {count: 0, last_used: null, days_idle: null}; }
 
     function matchesUsage(skill) {
@@ -632,11 +667,12 @@
       const activeIds = new Set(activeSkills().map(skill => skill.id));
       const skills = DATA.skills.filter(skill => {
         if (state.scope !== 'all' && skill.scope.level !== state.scope) return false;
+        if (state.bundle !== 'all' && (skill.bundle || '') !== state.bundle) return false;
         if (!runtimeVisible(skill)) return false;
         if (!matchesUsage(skill)) return false;
         return !query || `${skill.id} ${skill.name} ${skill.source_path}`.toLowerCase().includes(query);
       }).sort((a, b) => usageOf(b).count - usageOf(a).count);
-      $('#inventoryRows').innerHTML = skills.map(skill => `<tr data-skill="${esc(skill.id)}"><td><strong>${esc(skill.id)}</strong><br><span class="mono">${esc(skill.name)}</span></td><td><span class="badge">${esc(skill.scope.level)}</span></td><td><span class="badge ${activeIds.has(skill.id) ? 'active' : 'excluded'}">${activeIds.has(skill.id) ? 'active' : 'excluded'}</span>${skill.model_invocable === false ? ' <span class="badge">slash only</span>' : ''}</td><td>${usageCell(skill)}</td><td>${lastUsedCell(skill)}</td><td class="mono">${esc(skill.source_path)}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">Nothing found.</td></tr>';
+      $('#inventoryRows').innerHTML = skills.map(skill => `<tr data-skill="${esc(skill.id)}"><td><strong>${esc(skill.id)}</strong><br><span class="mono">${esc(skill.name)}</span></td><td><span class="badge">${esc(skill.scope.level)}</span>${skill.bundle ? `<br><span class="card-note">${esc(bundleTitle(skill.bundle))}</span>` : ''}</td><td><span class="badge ${activeIds.has(skill.id) ? 'active' : 'excluded'}">${activeIds.has(skill.id) ? 'active' : 'excluded'}</span>${skill.model_invocable === false ? ' <span class="badge">slash only</span>' : ''}</td><td>${usageCell(skill)}</td><td>${lastUsedCell(skill)}</td><td class="mono">${esc(skill.source_path)}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">Nothing found.</td></tr>';
       $$('#inventoryRows tr[data-skill]').forEach(row => row.addEventListener('click', () => openSkill(row.dataset.skill)));
     }
 
@@ -676,6 +712,10 @@
       $('#inventorySearch').addEventListener('input', event => { state.inventoryQuery = event.target.value; renderInventory(); });
       $('#scopeFilter').addEventListener('change', event => { state.scope = event.target.value; renderInventory(); });
       $('#usageFilter').addEventListener('change', event => { state.usage = event.target.value; renderInventory(); });
+      $('#bundleFilter').innerHTML = '<option value="all">All blocks</option>'
+        + (DATA.bundles || []).map(bundle => `<option value="${esc(bundle.id)}">${esc(bundle.title)} (${bundle.skill_count})</option>`).join('')
+        + '<option value="">Ungrouped</option>';
+      $('#bundleFilter').addEventListener('change', event => { state.bundle = event.target.value; renderInventory(); });
       $('#zoomIn').addEventListener('click', () => { state.zoom = Math.min(1.3, state.zoom + .1); renderMap(); });
       $('#zoomOut').addEventListener('click', () => { state.zoom = Math.max(.55, state.zoom - .1); renderMap(); });
       $('#drawerClose').addEventListener('click', closeDrawer); $('#backdrop').addEventListener('click', closeDrawer);

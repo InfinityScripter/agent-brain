@@ -601,6 +601,57 @@ def read_enabled_plugins(settings_path: Optional[Path] = None) -> List[str]:
     return sorted({key.split("@")[0] for key, value in enabled.items() if value})
 
 
+def classify_bundle(skill: Dict[str, Any], rules: Sequence[Dict[str, Any]]) -> Optional[str]:
+    """Name the block a skill belongs to: first matching rule, else its plugin.
+
+    Rules are ordered, so a skill named in one rule keeps that block even when a
+    later rule matches its prefix — ``ququ-orchestrator-code-style`` belongs to
+    the orchestrator block, not to ququ.
+    """
+
+    name = skill["name"]
+    source = skill.get("source_path", "")
+    for rule in rules:
+        prefix = rule.get("name_prefix")
+        pattern = rule.get("source_pattern")
+        if name in rule.get("names", []):
+            return rule["id"]
+        if prefix and name.startswith(prefix):
+            return rule["id"]
+        if pattern and re.search(pattern, source):
+            return rule["id"]
+    return skill.get("plugin_source") or skill["scope"].get("plugin")
+
+
+def bundle_summary(
+    skills: Sequence[Dict[str, Any]], rules: Sequence[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Per-block totals for the blocks that actually hold skills."""
+
+    titles = {rule["id"]: rule.get("title", rule["id"]) for rule in rules}
+    members: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    counted: set = set()
+    for skill in skills:
+        # One skill mounted in several roots is a single entry for the runtime.
+        if not skill.get("bundle") or listing_name(skill) in counted:
+            continue
+        counted.add(listing_name(skill))
+        members[skill["bundle"]].append(skill)
+
+    summary = []
+    for bundle_id, items in members.items():
+        summary.append(
+            {
+                "id": bundle_id,
+                "title": titles.get(bundle_id, bundle_id),
+                "skill_count": len(items),
+                "never_used": sum(1 for item in items if not item["usage"]["count"]),
+                "invocations": sum(item["usage"]["count"] for item in items),
+            }
+        )
+    return sorted(summary, key=lambda item: (-item["skill_count"], item["id"]))
+
+
 def listing_name(skill: Dict[str, Any]) -> str:
     """The name the runtime lists a skill under, plugin prefix included.
 
@@ -1070,6 +1121,9 @@ def build_inventory() -> Dict[str, Any]:
     occurrences, broken = collect_skill_occurrences(config, projects)
     skills, collisions = merge_skills(occurrences, config, projects)
     usage_summary = attach_skill_usage(skills, read_skill_usage())
+    bundle_rules = config.get("skill_bundles", [])
+    for skill in skills:
+        skill["bundle"] = classify_bundle(skill, bundle_rules)
     instructions = instruction_inventory(config, projects)
 
     for project in projects:
@@ -1113,6 +1167,7 @@ def build_inventory() -> Dict[str, Any]:
         "collisions": collisions,
         "broken_sources": broken,
         "instructions": instructions,
+        "bundles": bundle_summary(skills, bundle_rules),
         "stats": {
             "skill_sources": len(skills),
             "skill_mounts": len(occurrences),
@@ -1398,6 +1453,21 @@ def generate_audit(inventory: Dict[str, Any]) -> str:
                 f"- Total invocations: **{usage['total_invocations']}**",
                 f"- Listed to the model: **{len(listed)}** skills, about **{listing_cost(listed)}** tokens per session",
                 f"- Of those never invoked: about **{listing_cost([item for item in listed if not item['usage']['count']])}** tokens",
+                "",
+            ]
+        )
+    bundles = inventory.get("bundles") or []
+    if bundles:
+        lines.extend(
+            [
+                "## Blocks",
+                "",
+                "| Block | Skills | Never used | Invocations |",
+                "|---|---|---|---|",
+                *(
+                    f"| {bundle['title']} | {bundle['skill_count']} | {bundle['never_used']} | {bundle['invocations']} |"
+                    for bundle in bundles
+                ),
                 "",
             ]
         )
