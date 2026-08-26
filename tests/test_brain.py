@@ -612,21 +612,44 @@ class ListingOverrideTests(unittest.TestCase):
         context = {"domain": "personal", "project": None}
         self.assertEqual(self.overrides(skills, context), {})
 
-    def test_write_replaces_only_the_overrides_key(self):
+    def test_write_replaces_profile_entries_but_keeps_manual_toggles(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"
-            path.write_text(json.dumps({"model": "opus", "skillOverrides": {"stale": "off"}}), encoding="utf-8")
+            path.write_text(
+                json.dumps({"model": "opus", "skillOverrides": {"manual": "off", "stale": "user-invocable-only"}}),
+                encoding="utf-8",
+            )
             brain.write_skill_overrides({"fresh": "user-invocable-only"}, path)
             written = json.loads(path.read_text(encoding="utf-8"))
             backup = json.loads((path.parent / "settings.json.brain-backup").read_text(encoding="utf-8"))
         self.assertEqual(written["model"], "opus")
-        self.assertEqual(written["skillOverrides"], {"fresh": "user-invocable-only"})
-        self.assertEqual(backup["skillOverrides"], {"stale": "off"})
+        self.assertEqual(written["skillOverrides"], {"fresh": "user-invocable-only", "manual": "off"})
+        self.assertEqual(backup["skillOverrides"], {"manual": "off", "stale": "user-invocable-only"})
 
-    def test_empty_overrides_drop_the_key_entirely(self):
+    def test_manual_toggle_wins_over_profile_for_the_same_skill(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"
-            path.write_text(json.dumps({"model": "opus", "skillOverrides": {"stale": "off"}}), encoding="utf-8")
+            path.write_text(json.dumps({"skillOverrides": {"deploy": "on"}}), encoding="utf-8")
+            brain.write_skill_overrides({"deploy": "user-invocable-only"}, path)
+            written = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(written["skillOverrides"], {"deploy": "on"})
+
+    def test_empty_overrides_drop_profile_entries_but_keep_manual_toggles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(
+                json.dumps({"model": "opus", "skillOverrides": {"manual": "off", "stale": "user-invocable-only"}}),
+                encoding="utf-8",
+            )
+            brain.write_skill_overrides({}, path)
+            written = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(written["skillOverrides"], {"manual": "off"})
+        self.assertEqual(written["model"], "opus")
+
+    def test_empty_overrides_without_manual_toggles_drop_the_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(json.dumps({"model": "opus", "skillOverrides": {"stale": "user-invocable-only"}}), encoding="utf-8")
             brain.write_skill_overrides({}, path)
             written = json.loads(path.read_text(encoding="utf-8"))
         self.assertNotIn("skillOverrides", written)

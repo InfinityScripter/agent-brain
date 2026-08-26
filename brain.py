@@ -693,12 +693,24 @@ def skill_listing_overrides(inventory: Dict[str, Any], context: Dict[str, Any]) 
 
 
 def write_skill_overrides(overrides: Dict[str, str], settings_path: Optional[Path] = None) -> Path:
-    """Replace the skillOverrides block of the runtime settings, backing it up."""
+    """Write the profile's skillOverrides block, backing the file up.
+
+    Manual per-skill toggles ("on"/"off", written by ``brain skill``) survive
+    the rewrite and win over the profile; only the profile-managed
+    "user-invocable-only" entries are replaced.
+    """
 
     path = settings_path if settings_path is not None else CLAUDE_SETTINGS_PATH
     settings = read_settings_file(path)
-    if overrides:
-        settings["skillOverrides"] = overrides
+    existing = settings.get("skillOverrides")
+    manual = (
+        {key: value for key, value in existing.items() if value in TOGGLE_ACTIONS}
+        if isinstance(existing, dict)
+        else {}
+    )
+    merged = {**overrides, **manual}
+    if merged:
+        settings["skillOverrides"] = merged
     else:
         settings.pop("skillOverrides", None)
     write_settings_file(path, settings)
@@ -2870,8 +2882,6 @@ def command_skill_toggle(args: argparse.Namespace) -> int:
         return 2
     state = "enabled" if args.action == "on" else "disabled"
     print(f"Skill {args.name} {state} via {target}")
-    if args.settings == "user":
-        print("Note: `brain use` rewrites user-level skillOverrides; folder-level toggles survive profile switches.")
     return 0
 
 

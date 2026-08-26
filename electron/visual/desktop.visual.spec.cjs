@@ -43,6 +43,7 @@ test.beforeAll(async () => {
     cwd: root,
     env: {
       ...process.env,
+      HOME: fixture.home,
       AGENT_BRAIN_HOME: fixture.registry,
       LANG: 'en_US.UTF-8',
       LC_ALL: 'en_US.UTF-8',
@@ -538,4 +539,16 @@ test('folder inspector shows the harness and toggles a skill', async () => {
   await expect(skillRow()).toContainText('on @ local');
   const restored = JSON.parse(await fs.readFile(settingsPath, 'utf8'));
   expect(restored.skillOverrides['frontend-review']).toBe('on');
+
+  const ruleRow = () => page.locator('.harness-row').filter({ hasText: 'Tone of voice' }).first();
+  await expect(ruleRow()).toContainText('user');
+  await ruleRow().getByRole('button', { name: 'Off' }).click();
+  await expect(ruleRow().getByRole('button', { name: 'On' })).toBeVisible();
+  const rulePath = path.join(fixture.home, '.claude', 'rules', 'tone.md');
+  await expect(async () => {
+    await fs.access(`${rulePath}.disabled`);
+  }).toPass();
+  await ruleRow().getByRole('button', { name: 'On' }).click();
+  await expect(ruleRow().getByRole('button', { name: 'Off' })).toBeVisible();
+  await fs.access(rulePath);
 });

@@ -59,6 +59,13 @@ async function writeSkill(root, folder, name, description) {
 }
 
 async function createVisualFixture(registry) {
+  // A fake HOME keeps the fixture hermetic: with the real one, brain.py picks
+  // up the machine's installed plugins, enabled-plugin settings, and usage
+  // counters, and the inventory (and every screenshot) drifts with them.
+  const home = path.join(path.dirname(registry), 'home');
+  const homeRules = path.join(home, '.claude', 'rules');
+  await fs.mkdir(homeRules, { recursive: true });
+  await fs.writeFile(path.join(homeRules, 'tone.md'), '# Tone of voice\n\nShort sentences, no fluff.\n', 'utf8');
   const fixtureRoot = path.join(registry, 'fixture');
   const absoluteProjects = projects.map((project) => ({
     ...project,
@@ -122,12 +129,12 @@ async function createVisualFixture(registry) {
       cwd: path.join(__dirname, '..', '..'),
       encoding: 'utf8',
       timeout: 15_000,
-      env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' }
+      env: { ...process.env, HOME: home, PYTHONDONTWRITEBYTECODE: '1' }
     }
   );
   if (build.error) throw new Error(`Could not build visual fixture: ${build.error.message}`);
   if (build.status !== 0) throw new Error(build.stderr || build.stdout || 'Could not build visual fixture');
-  return { registry, paths: Object.fromEntries(absoluteProjects.map((project) => [project.id, project.path])) };
+  return { registry, home, paths: Object.fromEntries(absoluteProjects.map((project) => [project.id, project.path])) };
 }
 
 module.exports = { createVisualFixture };
