@@ -672,8 +672,8 @@ class SkillBundleTests(unittest.TestCase):
         self.assertIsNone(brain.classify_bundle(self.skill("humanizer"), self.RULES))
 
     def test_source_pattern_rule_assigns_bundle(self):
-        rules = [{"id": "tef", "title": "TEF", "source_pattern": "/junk/talalaev-m/"}]
-        skill = self.skill("whatever", source="/home/u/junk/talalaev-m/ai/skills/whatever")
+        rules = [{"id": "tef", "title": "TEF", "source_pattern": "/junk/dev-user/"}]
+        skill = self.skill("whatever", source="/home/u/junk/dev-user/ai/skills/whatever")
         self.assertEqual(brain.classify_bundle(skill, rules), "tef")
 
     def test_summary_counts_skills_and_idle_ones_per_bundle(self):

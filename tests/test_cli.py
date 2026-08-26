@@ -112,6 +112,71 @@ class AgentBrainCliTests(unittest.TestCase):
             second_data = json.loads(second_manifest.read_text(encoding="utf-8"))
             self.assertEqual(second_data["related_projects"], [])
 
+    def test_inspect_toggle_and_recommend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            registry = home / ".agent-brain"
+            project = home / "Projects" / "shop"
+            project.mkdir(parents=True)
+            (project / "package.json").write_text(
+                json.dumps({"dependencies": {"react": "19.0.0"}}), encoding="utf-8"
+            )
+            rules = home / ".claude" / "rules"
+            rules.mkdir(parents=True)
+            (rules / "style.md").write_text("# Style rule\n\nKeep it short.\n", encoding="utf-8")
+            skill = home / ".claude" / "skills" / "react-best-practices"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\nname: react-best-practices\ndescription: React guidance\n---\n", encoding="utf-8"
+            )
+
+            initialized = self.run_brain(home, registry, "init")
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            added = self.run_brain(home, registry, "project", "add", str(project), "--domain", "personal.software")
+            self.assertEqual(added.returncode, 0, added.stderr)
+
+            inspected = self.run_brain(home, registry, "inspect", "--cwd", str(project), "--json")
+            self.assertEqual(inspected.returncode, 0, inspected.stderr)
+            harness = json.loads(inspected.stdout)
+            react = next(item for item in harness["skills"] if item["listed_name"] == "react-best-practices")
+            self.assertTrue(react["active"])
+            self.assertIsNone(react["override"]["effective"])
+            style = next(item for item in harness["rules"] if item["name"] == "style")
+            self.assertTrue(style["enabled"])
+            self.assertEqual(style["location"], "user")
+
+            toggled = self.run_brain(home, registry, "skill", "off", "react-best-practices", "--cwd", str(project))
+            self.assertEqual(toggled.returncode, 0, toggled.stderr)
+            local_settings = json.loads(
+                (project / ".claude" / "settings.local.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(local_settings["skillOverrides"]["react-best-practices"], "off")
+
+            inspected = self.run_brain(home, registry, "inspect", "--cwd", str(project), "--json")
+            harness = json.loads(inspected.stdout)
+            react = next(item for item in harness["skills"] if item["listed_name"] == "react-best-practices")
+            self.assertEqual(react["override"], {"effective": "off", "level": "local"})
+
+            rule_off = self.run_brain(home, registry, "rule", "off", "style", "--cwd", str(project))
+            self.assertEqual(rule_off.returncode, 0, rule_off.stderr)
+            self.assertTrue((rules / "style.md.disabled").is_file())
+            rule_on = self.run_brain(home, registry, "rule", "on", "style", "--cwd", str(project))
+            self.assertEqual(rule_on.returncode, 0, rule_on.stderr)
+            self.assertTrue((rules / "style.md").is_file())
+
+            recommended = self.run_brain(home, registry, "recommend", "--cwd", str(project), "--json")
+            self.assertEqual(recommended.returncode, 0, recommended.stderr)
+            advice = json.loads(recommended.stdout)
+            react_advice = next(
+                item for item in advice["recommendations"] if item["listed_name"] == "react-best-practices"
+            )
+            self.assertEqual(react_advice["status"], "recommended")
+            self.assertTrue(any("react" in reason for reason in react_advice["reasons"]))
+            self.assertTrue(any("CLAUDE.md" in gap for gap in advice["gaps"]))
+
+            unknown = self.run_brain(home, registry, "skill", "off", "ghost", "--cwd", str(project))
+            self.assertEqual(unknown.returncode, 2)
+
     def test_build_generates_relations_map(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

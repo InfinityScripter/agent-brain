@@ -130,6 +130,15 @@ function registerIpc() {
     if (!payload || typeof payload !== 'object') throw new TypeError('Invalid skill scope payload');
     return brain.updateSkillScope(payload);
   }));
+  ipcMain.handle('brain:inspect-folder', trusted((cwd) => brain.inspectFolder(cwd)));
+  ipcMain.handle('brain:toggle-skill', trusted((payload) => {
+    if (!payload || typeof payload !== 'object') throw new TypeError('Invalid skill toggle payload');
+    return brain.toggleSkill(payload);
+  }));
+  ipcMain.handle('brain:toggle-rule', trusted((payload) => {
+    if (!payload || typeof payload !== 'object') throw new TypeError('Invalid rule toggle payload');
+    return brain.toggleRule(payload);
+  }));
   ipcMain.handle('system:choose-directory', trusted(async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
       title: 'Choose a project or workspace folder',

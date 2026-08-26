@@ -696,17 +696,12 @@ def write_skill_overrides(overrides: Dict[str, str], settings_path: Optional[Pat
     """Replace the skillOverrides block of the runtime settings, backing it up."""
 
     path = settings_path if settings_path is not None else CLAUDE_SETTINGS_PATH
-    try:
-        settings = read_json(path)
-    except (OSError, ValueError, json.JSONDecodeError):
-        settings = {}
-    else:
-        write_text_atomic(path.with_name(path.name + ".brain-backup"), json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
+    settings = read_settings_file(path)
     if overrides:
         settings["skillOverrides"] = overrides
     else:
         settings.pop("skillOverrides", None)
-    write_text_atomic(path, json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
+    write_settings_file(path, settings)
     return path
 
 
@@ -714,16 +709,453 @@ def read_listing_limits(settings_path: Optional[Path] = None) -> Dict[str, Optio
     """Caps the runtime applies to the skill listing it puts in the prompt."""
 
     path = settings_path if settings_path is not None else CLAUDE_SETTINGS_PATH
-    try:
-        settings = read_json(path)
-    except (OSError, ValueError, json.JSONDecodeError):
-        settings = {}
+    settings = read_settings_file(path)
     max_chars = settings.get("skillListingMaxDescChars")
     fraction = settings.get("skillListingBudgetFraction")
     return {
         "max_desc_chars": int(max_chars) if isinstance(max_chars, (int, float)) else None,
         "budget_fraction": float(fraction) if isinstance(fraction, (int, float)) else None,
     }
+
+
+RULE_DISABLED_SUFFIX = ".md.disabled"
+RULE_READ_LIMIT = 256_000
+TOGGLE_ACTIONS = ("on", "off")
+CLAUDE_RELEVANT_RUNTIMES = {"claude", "shared", "project"}
+KNOWN_MCP_TRANSPORTS = {"stdio", "http", "sse", "ws"}
+
+
+def claude_dir(home: Optional[Path] = None) -> Path:
+    return (home or Path.home()) / ".claude"
+
+
+def read_settings_file(path: Path) -> Dict[str, Any]:
+    try:
+        settings = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def write_settings_file(path: Path, settings: Dict[str, Any]) -> None:
+    """Backup-then-write for runtime settings files. The backup copies the raw
+    prior bytes, so even a corrupt original survives the overwrite."""
+
+    if path.is_file():
+        write_text_atomic(
+            path.with_name(path.name + ".brain-backup"),
+            path.read_text(encoding="utf-8", errors="replace"),
+        )
+    write_text_atomic(path, json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
+
+
+def settings_chain(root: Path, home: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Settings files that apply inside ``root``, least specific first."""
+
+    return [
+        {"level": "user", "path": claude_dir(home) / "settings.json"},
+        {"level": "project", "path": root / ".claude" / "settings.json"},
+        {"level": "local", "path": root / ".claude" / "settings.local.json"},
+    ]
+
+
+def markdown_title(text: str) -> Optional[str]:
+    match = re.search(r"^#{1,3}\s+(.+)$", text, flags=re.MULTILINE)
+    return match.group(1).strip() if match else None
+
+
+def count_lines(text: str) -> int:
+    return text.count("\n") + (0 if text.endswith("\n") else 1)
+
+
+def rule_dirs_for(root: Path, home: Optional[Path] = None) -> List[Tuple[str, Path]]:
+    """Rules directories that resolve inside their expected parent. A rules
+    directory symlinked elsewhere would move the toggle boundary with it, so
+    such a directory is not recognized at all."""
+
+    candidates = [
+        ("user", claude_dir(home) / "rules", safe_resolve(claude_dir(home))),
+        ("folder", root / ".claude" / "rules", safe_resolve(root)),
+    ]
+    dirs = []
+    for location, directory, base in candidates:
+        if not directory.is_dir():
+            continue
+        resolved = safe_resolve(directory)
+        if is_relative_to(resolved, base):
+            dirs.append((location, resolved))
+    return dirs
+
+
+def rules_inventory(root: Path, home: Optional[Path] = None) -> List[Dict[str, Any]]:
+    rules = []
+    for location, directory in rule_dirs_for(root, home):
+        for path in sorted(directory.rglob("*")):
+            if not path.name.endswith((".md", RULE_DISABLED_SUFFIX)):
+                continue
+            # A symlinked rule would put a foreign file's text into the
+            # inventory; skip anything that is or resolves through a link.
+            if path.is_symlink() or not path.is_file() or not is_relative_to(safe_resolve(path), directory):
+                continue
+            enabled = not path.name.endswith(RULE_DISABLED_SUFFIX)
+            suffix = RULE_DISABLED_SUFFIX if not enabled else ".md"
+            name = str(path.relative_to(directory))[: -len(suffix)]
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                text = handle.read(RULE_READ_LIMIT)
+            rules.append(
+                {
+                    "name": name,
+                    "path": str(path),
+                    "location": location,
+                    "enabled": enabled,
+                    "title": markdown_title(text) or name,
+                    "summary": first_paragraph(re.sub(r"^#.*$", "", text, flags=re.MULTILINE).strip()),
+                    "bytes": path.stat().st_size,
+                    "lines": count_lines(text),
+                }
+            )
+    return rules
+
+
+def instruction_chain(cwd: Path, home: Optional[Path] = None) -> List[Dict[str, Any]]:
+    base = safe_resolve(home or Path.home())
+    resolved_cwd = safe_resolve(cwd)
+    directories: List[Tuple[Path, str]] = []
+    cursor = resolved_cwd
+    while True:
+        directories.append((cursor, "folder" if cursor == resolved_cwd else "parent"))
+        if cursor == base or cursor.parent == cursor or not is_relative_to(cursor.parent, base):
+            break
+        cursor = cursor.parent
+    directories.append((claude_dir(home), "user"))
+    items = []
+    for directory, level in directories:
+        for filename in ("CLAUDE.md", "AGENTS.md"):
+            candidate = directory / filename
+            if not candidate.is_file():
+                continue
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+            items.append(
+                {
+                    "path": str(candidate),
+                    "level": level,
+                    "bytes": len(text.encode("utf-8")),
+                    "lines": count_lines(text),
+                    "title": markdown_title(text) or filename,
+                }
+            )
+    return items
+
+
+def agents_inventory(root: Path, home: Optional[Path] = None) -> List[Dict[str, Any]]:
+    agents = []
+    for location, directory in (("user", claude_dir(home) / "agents"), ("folder", root / ".claude" / "agents")):
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.md")):
+            metadata = parse_skill_metadata(path, path.stem)
+            agents.append(
+                {
+                    "name": path.stem,
+                    "path": str(path),
+                    "location": location,
+                    "description": metadata["description"],
+                }
+            )
+    return agents
+
+
+def mcp_inventory(root: Path, home: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """MCP servers visible in ``root``. Names and transports only: commands,
+    args, URLs, env, and headers routinely embed credentials and never leave
+    this function."""
+
+    servers = []
+    sources = [
+        ("project", root / ".mcp.json"),
+        ("user", (home or Path.home()) / ".claude.json"),
+    ]
+    for location, path in sources:
+        entries = read_settings_file(path).get("mcpServers")
+        if not isinstance(entries, dict):
+            continue
+        for name, entry in sorted(entries.items()):
+            if not isinstance(entry, dict):
+                continue
+            declared = entry.get("type")
+            if declared not in KNOWN_MCP_TRANSPORTS:
+                declared = "stdio" if entry.get("command") else "http"
+            servers.append({"name": name, "transport": declared, "location": location})
+    return servers
+
+
+def hook_counts(settings: Dict[str, Any]) -> Dict[str, int]:
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return {}
+    return {
+        event: len(entries)
+        for event, entries in sorted(hooks.items())
+        if isinstance(entries, list) and entries
+    }
+
+
+def effective_override(listed: str, chain: Sequence[Dict[str, Any]]) -> Dict[str, Optional[str]]:
+    effective: Optional[str] = None
+    level: Optional[str] = None
+    for item in chain:
+        overrides = item.get("overrides") or {}
+        if listed in overrides:
+            effective = overrides[listed]
+            level = item["level"]
+    return {"effective": effective, "level": level}
+
+
+def resolve_harness_root(context: Dict[str, Any], cwd: Path) -> Path:
+    project = context.get("project")
+    return safe_resolve(expand_path(project["path"])) if project else safe_resolve(cwd)
+
+
+def harness_listed(skill: Dict[str, Any], installed_plugins: set) -> bool:
+    """Skills the folder inspector shows and toggles.
+
+    Wider than ``skill_listing_overrides``: "shared" and "project" mounts are
+    Claude-relevant too; only pure codex-only mounts stay out of the picture.
+    """
+
+    scope = skill["scope"]
+    if scope["level"] == "archive" or not skill.get("model_invocable", True):
+        return False
+    if not set(skill.get("runtimes") or ["claude"]) & CLAUDE_RELEVANT_RUNTIMES:
+        return False
+    plugin = skill.get("plugin_source") or scope.get("plugin")
+    return not plugin or plugin in installed_plugins
+
+
+def harness_inventory(cwd: Path, inventory: Dict[str, Any], home: Optional[Path] = None) -> Dict[str, Any]:
+    """Everything the agent harness mounts for a folder, with toggle state."""
+
+    context = resolve_context(cwd, inventory)
+    root = resolve_harness_root(context, cwd)
+
+    chain = settings_chain(root, home)
+    for item in chain:
+        settings = read_settings_file(item["path"])
+        item["exists"] = item["path"].is_file()
+        item["overrides"] = settings.get("skillOverrides") if isinstance(settings.get("skillOverrides"), dict) else {}
+        item["hooks"] = hook_counts(settings)
+        item["path"] = str(item["path"])
+
+    installed_plugins = set(context.get("active_plugins", []))
+    skills = []
+    for skill in inventory["skills"]:
+        if not harness_listed(skill, installed_plugins):
+            continue
+        scope = skill["scope"]
+        listed = listing_name(skill)
+        active = skill_is_active(skill, context)
+        override = effective_override(listed, chain)
+        skills.append(
+            {
+                "listed_name": listed,
+                "id": skill["id"],
+                "description": first_paragraph(skill.get("description") or ""),
+                "scope_level": scope["level"],
+                "scope_detail": scope.get("project") or scope.get("domain") or scope.get("plugin"),
+                "source_path": skill.get("source_path"),
+                "usage": skill.get("usage") or {"count": 0, "last_used": None},
+                "active": active,
+                "override": override,
+                # An explicit "on" override forces the runtime listing even
+                # when the registry scopes the skill elsewhere.
+                "visible": override["effective"] == "on" or (active and override["effective"] != "off"),
+            }
+        )
+    skills.sort(key=lambda item: (not item["active"], item["listed_name"]))
+
+    return {
+        "context": context,
+        "root": str(root),
+        "settings_files": chain,
+        "skills": skills,
+        "rules": rules_inventory(root, home),
+        "instructions": instruction_chain(cwd, home),
+        "agents": agents_inventory(root, home),
+        "mcp": mcp_inventory(root, home),
+    }
+
+
+def toggle_skill(name: str, action: str, settings_path: Path, inventory: Dict[str, Any]) -> Path:
+    """Set one skillOverrides key in ``settings_path``, preserving the rest."""
+
+    if action not in TOGGLE_ACTIONS:
+        raise ValueError(f"Unknown action: {action}. Expected one of {TOGGLE_ACTIONS}.")
+    installed_plugins = set(inventory.get("config", {}).get("active_plugins") or [])
+    listed_names = {
+        listing_name(skill)
+        for skill in inventory["skills"]
+        if harness_listed(skill, installed_plugins)
+    }
+    if name not in listed_names:
+        raise ValueError(f"Unknown skill: {name}. The name must match the runtime listing.")
+    if settings_path.is_file():
+        # A parse failure must abort: writing over an unreadable settings file
+        # would silently drop everything else the user keeps in it.
+        try:
+            settings = read_json(settings_path)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError(f"Cannot parse {settings_path} ({error}); fix or remove it before toggling.")
+        if not isinstance(settings, dict):
+            raise ValueError(f"{settings_path} is not a JSON object; refusing to overwrite it.")
+    else:
+        settings = {}
+    overrides = settings.get("skillOverrides")
+    if not isinstance(overrides, dict):
+        overrides = {}
+    overrides[name] = action
+    settings["skillOverrides"] = overrides
+    write_settings_file(settings_path, settings)
+    return settings_path
+
+
+def resolve_rule_target(identifier: str, rule_dirs: Sequence[Path]) -> Path:
+    """Locate a rule file by name or path, refusing anything that is a
+    symlink or resolves outside the recognized rules directories."""
+
+    resolved_dirs = [safe_resolve(directory) for directory in rule_dirs if directory.is_dir()]
+
+    def acceptable(path: Path) -> bool:
+        if not path.name.endswith((".md", RULE_DISABLED_SUFFIX)):
+            return False
+        if path.is_symlink() or not path.is_file():
+            return False
+        resolved = safe_resolve(path)
+        return any(is_relative_to(resolved, directory) for directory in resolved_dirs)
+
+    direct = Path(identifier).expanduser()
+    if direct.is_absolute():
+        if acceptable(direct):
+            return direct
+        raise ValueError(f"Not a rule file inside the recognized rules directories: {identifier}")
+
+    stem = identifier
+    for suffix in (RULE_DISABLED_SUFFIX, ".md"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+    matches = []
+    for directory in resolved_dirs:
+        for filename in (f"{stem}.md", f"{stem}{RULE_DISABLED_SUFFIX}"):
+            candidate = directory / filename
+            if acceptable(candidate):
+                matches.append(candidate)
+    if not matches:
+        raise ValueError(f"Rule not found: {identifier}")
+    if len(matches) > 1:
+        listed = ", ".join(str(match) for match in matches)
+        raise ValueError(f"Rule name is ambiguous, pass a full path: {listed}")
+    return matches[0]
+
+
+def toggle_rule(identifier: str, action: str, rule_dirs: Sequence[Path]) -> Dict[str, Any]:
+    """Enable or disable a rule file by renaming ``.md`` <-> ``.md.disabled``."""
+
+    if action not in TOGGLE_ACTIONS:
+        raise ValueError(f"Unknown action: {action}. Expected one of {TOGGLE_ACTIONS}.")
+    current = resolve_rule_target(identifier, rule_dirs)
+    enabled = not current.name.endswith(RULE_DISABLED_SUFFIX)
+    wanted = action == "on"
+    if enabled == wanted:
+        return {"path": str(current), "enabled": enabled, "changed": False}
+    if wanted:
+        target = current.with_name(current.name[: -len(RULE_DISABLED_SUFFIX)] + ".md")
+    else:
+        target = current.with_name(current.name[: -len(".md")] + RULE_DISABLED_SUFFIX)
+    if target.exists():
+        raise ValueError(f"Cannot rename: {target} already exists.")
+    current.rename(target)
+    return {"path": str(target), "enabled": wanted, "changed": True}
+
+
+STACK_DEPENDENCY_SIGNALS = [
+    (r"^react(-dom)?$", "React UI", r"\breact\b"),
+    (r"^next$", "Next.js", r"react-performance|modern-web"),
+    (r"^electron$", "Electron desktop", r"electron"),
+    (r"jest|vitest|^@playwright/test$|@testing-library", "test tooling", r"test-driven|test-quality|react-testing|testing"),
+    (r"^@mui/|^antd$|^styled-components$|tailwind", "UI component library", r"web-design|design-inspo|modern-web"),
+]
+
+
+def detect_stack_signals(root: Path) -> List[Dict[str, str]]:
+    signals = []
+    payload = read_settings_file(root / "package.json")
+    dependencies: Dict[str, Any] = {}
+    for key in ("dependencies", "devDependencies"):
+        block = payload.get(key)
+        if isinstance(block, dict):
+            dependencies.update(block)
+    for dependency_pattern, label, skill_pattern in STACK_DEPENDENCY_SIGNALS:
+        matched = sorted(name for name in dependencies if re.search(dependency_pattern, name))
+        if matched:
+            signals.append(
+                {
+                    "label": label,
+                    "evidence": f"package.json: {', '.join(matched[:4])}",
+                    "skill_pattern": skill_pattern,
+                }
+            )
+    typescript_evidence = [item for item, present in (
+        ("package.json: typescript", "typescript" in dependencies),
+        ("tsconfig.json", (root / "tsconfig.json").is_file()),
+    ) if present]
+    if typescript_evidence:
+        signals.append({"label": "TypeScript", "evidence": ", ".join(typescript_evidence), "skill_pattern": r"typescript"})
+    if (root / "pyproject.toml").is_file() or next(root.glob("*.py"), None) is not None:
+        signals.append({"label": "Python", "evidence": "Python sources", "skill_pattern": r"python"})
+    return signals
+
+
+def recommend_for_folder(harness: Dict[str, Any]) -> Dict[str, Any]:
+    """Deterministic advice: code signals matched against installed skills."""
+
+    root = Path(harness["root"])
+    signals = detect_stack_signals(root)
+    recommendations: Dict[str, Dict[str, Any]] = {}
+    for signal in signals:
+        pattern = re.compile(signal["skill_pattern"], re.IGNORECASE)
+        for skill in harness["skills"]:
+            if not pattern.search(skill["listed_name"]):
+                continue
+            entry = recommendations.setdefault(
+                skill["listed_name"],
+                {
+                    "listed_name": skill["listed_name"],
+                    "id": skill["id"],
+                    "description": skill["description"],
+                    "status": "already-active" if skill["visible"] else "recommended",
+                    "reasons": [],
+                },
+            )
+            reason = f"{signal['label']} detected ({signal['evidence']})"
+            if reason not in entry["reasons"]:
+                entry["reasons"].append(reason)
+
+    gaps = []
+    if not (root / "CLAUDE.md").is_file() and not (root / "AGENTS.md").is_file():
+        gaps.append(f"No CLAUDE.md or AGENTS.md in {root} — the agent starts here without project instructions.")
+    if not any(rule["location"] == "folder" for rule in harness["rules"]) and signals:
+        gaps.append("No folder-level rules in .claude/rules — conventions live only in your head.")
+
+    cleanup = sorted(
+        skill["listed_name"]
+        for skill in harness["skills"]
+        if skill["active"] and skill["scope_level"] == "project" and not skill["usage"].get("count")
+    )
+
+    ordered = sorted(
+        recommendations.values(),
+        key=lambda item: (item["status"] != "recommended", item["listed_name"]),
+    )
+    return {"signals": signals, "recommendations": ordered, "gaps": gaps, "cleanup": cleanup}
 
 
 def find_project_for_path(source: Path, projects: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -2340,6 +2772,127 @@ def command_skill_scope(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_inspect(args: argparse.Namespace) -> int:
+    inventory = load_or_build_inventory()
+    harness = harness_inventory(Path(args.cwd), inventory)
+    harness["advice"] = recommend_for_folder(harness)
+    if args.json:
+        print(json.dumps(harness, ensure_ascii=False, indent=2))
+        return 0
+    context = harness["context"]
+    project = context.get("project")
+    print(f"Folder: {harness['root']}")
+    print(f"Domain: {context['domain']} (source: {context['source']})"
+          + (f", project: {project['id']}" if project else ""))
+    print()
+    print("Settings files:")
+    for item in harness["settings_files"]:
+        marker = "present" if item["exists"] else "absent"
+        hooks = ", ".join(f"{event}:{count}" for event, count in item["hooks"].items()) or "no hooks"
+        print(f"  {item['level']:<8} {marker:<8} {hooks}  {item['path']}")
+    active = [item for item in harness["skills"] if item["active"]]
+    print()
+    print(f"Skills the agent can select here ({len(active)}):")
+    for item in active:
+        override = item["override"]
+        label = f" [{override['effective']} @ {override['level']}]" if override["effective"] else ""
+        print(f"  {item['listed_name']}{label} — {item['description']}")
+    print(f"Out of context here: {len(harness['skills']) - len(active)} skills (use --json for the list).")
+    print()
+    print(f"Rules ({len(harness['rules'])}):")
+    for rule in harness["rules"]:
+        state = "on " if rule["enabled"] else "OFF"
+        print(f"  [{state}] {rule['name']} ({rule['location']}) — {rule['title']}")
+    print()
+    print(f"Instruction files ({len(harness['instructions'])}):")
+    for item in harness["instructions"]:
+        print(f"  {item['level']:<7} {item['lines']:>5} lines  {item['path']}")
+    if harness["agents"]:
+        print()
+        print(f"Agents ({len(harness['agents'])}):")
+        for agent in harness["agents"]:
+            print(f"  {agent['name']} ({agent['location']}) — {agent['description']}")
+    if harness["mcp"]:
+        print()
+        print(f"MCP servers ({len(harness['mcp'])}):")
+        for server in harness["mcp"]:
+            print(f"  {server['name']} ({server['transport']}, {server['location']})")
+    return 0
+
+
+def command_recommend(args: argparse.Namespace) -> int:
+    inventory = load_or_build_inventory()
+    harness = harness_inventory(Path(args.cwd), inventory)
+    result = recommend_for_folder(harness)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    print(f"Folder: {harness['root']}")
+    if result["signals"]:
+        print("Detected in the code:")
+        for signal in result["signals"]:
+            print(f"  {signal['label']} — {signal['evidence']}")
+    else:
+        print("No recognizable stack signals in this folder.")
+    print()
+    recommended = [item for item in result["recommendations"] if item["status"] == "recommended"]
+    covered = [item for item in result["recommendations"] if item["status"] == "already-active"]
+    if recommended:
+        print("Worth enabling here:")
+        for item in recommended:
+            print(f"  {item['listed_name']} — {item['description']}")
+            for reason in item["reasons"]:
+                print(f"      reason: {reason}")
+    else:
+        print("Nothing new to enable: every matching installed skill is already active.")
+    if covered:
+        print()
+        print("Already active and matching the stack: " + ", ".join(item["listed_name"] for item in covered))
+    for gap in result["gaps"]:
+        print()
+        print(f"Gap: {gap}")
+    if result["cleanup"]:
+        print()
+        print("Never used here (candidates to switch off): " + ", ".join(result["cleanup"]))
+    return 0
+
+
+def command_skill_toggle(args: argparse.Namespace) -> int:
+    inventory = load_or_build_inventory()
+    cwd = Path(args.cwd)
+    context = resolve_context(cwd, inventory)
+    root = resolve_harness_root(context, cwd)
+    target = next(item["path"] for item in settings_chain(root) if item["level"] == args.settings)
+    try:
+        toggle_skill(args.name, args.action, target, inventory)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    state = "enabled" if args.action == "on" else "disabled"
+    print(f"Skill {args.name} {state} via {target}")
+    if args.settings == "user":
+        print("Note: `brain use` rewrites user-level skillOverrides; folder-level toggles survive profile switches.")
+    return 0
+
+
+def command_rule_toggle(args: argparse.Namespace) -> int:
+    inventory = load_or_build_inventory()
+    cwd = Path(args.cwd)
+    context = resolve_context(cwd, inventory)
+    root = resolve_harness_root(context, cwd)
+    directories = [directory for _, directory in rule_dirs_for(root)]
+    try:
+        state = toggle_rule(args.name, args.action, directories)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    if not state["changed"]:
+        print(f"Rule already {'enabled' if state['enabled'] else 'disabled'}: {state['path']}")
+        return 0
+    print(f"Rule {'enabled' if state['enabled'] else 'disabled'}: {state['path']}")
+    return 0
+
+
 def command_status(args: argparse.Namespace) -> int:
     inventory = load_or_build_inventory()
     if args.domain and args.domain not in {item["id"] for item in inventory["domains"]}:
@@ -2629,6 +3182,40 @@ def create_parser() -> argparse.ArgumentParser:
     skill_scope_parser.add_argument("--project")
     skill_scope_parser.add_argument("--plugin")
     skill_scope_parser.set_defaults(func=command_skill_scope)
+    for toggle_action in ("on", "off"):
+        skill_toggle_parser = skill_subparsers.add_parser(
+            toggle_action,
+            help=f"turn a skill {toggle_action} for a folder via skillOverrides",
+        )
+        skill_toggle_parser.add_argument("name", help="skill name as the runtime lists it (plugin:name for plugins)")
+        skill_toggle_parser.add_argument("--cwd", default=os.getcwd())
+        skill_toggle_parser.add_argument(
+            "--settings",
+            choices=["user", "project", "local"],
+            default="local",
+            help="which settings.json to write (default: the folder's settings.local.json)",
+        )
+        skill_toggle_parser.set_defaults(func=command_skill_toggle, action=toggle_action)
+
+    rule_parser = subparsers.add_parser("rule", help="enable or disable instruction rules")
+    rule_subparsers = rule_parser.add_subparsers(dest="rule_command", required=True)
+    for toggle_action in ("on", "off"):
+        rule_toggle_parser = rule_subparsers.add_parser(
+            toggle_action, help=f"turn a rule {toggle_action} by renaming .md <-> .md.disabled"
+        )
+        rule_toggle_parser.add_argument("name", help="rule name or path inside a recognized rules directory")
+        rule_toggle_parser.add_argument("--cwd", default=os.getcwd())
+        rule_toggle_parser.set_defaults(func=command_rule_toggle, action=toggle_action)
+
+    inspect_parser = subparsers.add_parser("inspect", help="show the full agent harness of a folder")
+    inspect_parser.add_argument("--cwd", default=os.getcwd())
+    inspect_parser.add_argument("--json", action="store_true")
+    inspect_parser.set_defaults(func=command_inspect)
+
+    recommend_parser = subparsers.add_parser("recommend", help="suggest skills for a folder based on its code")
+    recommend_parser.add_argument("--cwd", default=os.getcwd())
+    recommend_parser.add_argument("--json", action="store_true")
+    recommend_parser.set_defaults(func=command_recommend)
 
     status_parser = subparsers.add_parser("status", help="resolve active context")
     status_parser.add_argument("--cwd", default=os.getcwd())

@@ -17,6 +17,12 @@ belong in this folder?**
   the graph.
 - **Context resolver** — simulate any folder and see exactly which domain,
   project, workspace, skills, and workflows an agent will receive there.
+- **Folder inspector** — pick an application folder and see its whole agent
+  harness: skills, rules, instruction files, agents, hooks, and MCP servers,
+  each with where it is installed and what it is for. Switch skills and rules
+  on or off per folder, and get deterministic recommendations of what is worth
+  enabling based on the code in that folder (`brain inspect`,
+  `brain recommend`, `brain skill on|off`, `brain rule on|off`).
 - **Collision radar and health checks** — find same-name skills and broken
   references before they surprise an agent mid-task.
 - **Onboarding skill** — `skills/brain-onboarding` lets your agent populate a
@@ -109,6 +115,10 @@ domain, project, plugin, archive, or automatic source-based ownership.
 ./bin/brain init
 ./bin/brain build
 ./bin/brain status --cwd /path/to/project
+./bin/brain inspect --cwd /path/to/project
+./bin/brain recommend --cwd /path/to/project
+./bin/brain skill off <listed-name> --cwd /path/to/project
+./bin/brain rule off <rule-name> --cwd /path/to/project
 ./bin/brain explain <skill-name-or-id> --cwd /path/to/project
 ./bin/brain validate
 ./bin/brain use personal

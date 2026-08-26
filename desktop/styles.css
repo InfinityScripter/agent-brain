@@ -213,6 +213,24 @@ kbd { padding: 3px 5px; border: 1px solid #39414d; border-radius: 4px; color: #7
 .primary:hover { background: white; }
 .simulation-result { margin-top: 15px; min-height: 390px; }
 .empty-state { display: grid; place-items: center; color: var(--faint); border: 1px dashed #343b46; border-radius: var(--radius); font: 10px var(--mono); }
+.inspector-result { display: grid; gap: 14px; align-content: start; }
+.inspector-result.empty-state { min-height: 260px; }
+.harness-panel { display: grid; gap: 10px; }
+.harness-filter { height: 34px; padding: 0 12px; color: var(--text); border: 1px solid var(--line); border-radius: 8px; background: #0f1318; font: 10px var(--mono); }
+.harness-list { display: grid; gap: 6px; max-height: 360px; overflow: auto; }
+.harness-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #12161b; }
+.harness-row.off { opacity: .55; }
+.harness-title { font: 10px var(--mono); color: var(--text); overflow-wrap: anywhere; }
+.harness-row small { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.harness-badges { display: inline-flex; flex-wrap: wrap; gap: 5px; margin-left: 8px; vertical-align: middle; }
+.badge { padding: 2px 6px; border: 1px solid var(--line); border-radius: 6px; color: #b8c1cc; font: 8px var(--mono); }
+.badge.warn { color: var(--red); border-color: rgba(255,120,108,.3); }
+.badge.ok { color: var(--green, #7ad9a3); border-color: rgba(122,217,163,.3); }
+.toggle-button { min-width: 52px; height: 28px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-3); cursor: pointer; font-size: 10px; }
+.toggle-button:disabled { opacity: .5; cursor: default; }
+.reco-reason { color: var(--faint); }
+.inspector-note { margin: 0; color: var(--muted); font-size: 11px; }
+.inspector-gap { margin: 0; color: var(--yellow); font-size: 11px; }
 .context-chain { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; margin: 0 0 18px; }
 .context-chain span { padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); font: 9px var(--mono); }
 .context-chain i { color: var(--faint); font-style: normal; }

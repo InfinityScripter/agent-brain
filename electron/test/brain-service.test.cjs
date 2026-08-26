@@ -172,6 +172,31 @@ else:
   service.stop();
 });
 
+test('folder inspector methods pass validated arguments', async (context) => {
+  const root = await temporaryBrain(`
+import json, pathlib, sys
+root = pathlib.Path(__file__).parent
+with (root / 'calls.jsonl').open('a') as handle: handle.write(json.dumps(sys.argv[1:]) + '\\n')
+print(json.dumps({'root': 'stub'}))
+`);
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const service = createBrainService(root);
+  const cwd = path.resolve('/tmp/apps/shop');
+  assert.deepEqual(await service.inspectFolder(cwd), { root: 'stub' });
+  assert.deepEqual(await service.toggleSkill({ name: 'react', action: 'off', cwd, settings: 'local' }), { root: 'stub' });
+  assert.deepEqual(await service.toggleRule({ name: 'style', action: 'on', cwd }), { root: 'stub' });
+  const calls = (await fs.readFile(path.join(root, 'calls.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.deepEqual(calls[0].slice(-4), ['inspect', '--cwd', cwd, '--json']);
+  assert.deepEqual(calls[1].slice(-7), ['skill', 'off', 'react', '--cwd', cwd, '--settings', 'local']);
+  assert.deepEqual(calls[2].slice(-4), ['inspect', '--cwd', cwd, '--json']);
+  assert.deepEqual(calls[3].slice(-5), ['rule', 'on', 'style', '--cwd', cwd]);
+  await assert.rejects(service.toggleSkill({ name: '--evil', action: 'off', cwd }), /must not start/);
+  await assert.rejects(service.toggleSkill({ name: 'react', action: 'purge', cwd }), /action must be/);
+  await assert.rejects(service.toggleSkill({ name: 'react', action: 'off', cwd, settings: 'enterprise' }), /settings must be/);
+  await assert.rejects(service.toggleRule({ name: 'style', action: 'toggle', cwd }), /action must be/);
+  service.stop();
+});
+
 test('stop rejects queued mutations and prevents later subprocesses', async (context) => {
   const root = await temporaryBrain(`
 import json, pathlib, time

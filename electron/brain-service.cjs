@@ -298,6 +298,50 @@ function createBrainService(brainRoot, options = {}) {
     return serializeMutation(async () => { await runBrain(args); return parseInventory(); });
   }
 
+  function assertToggleAction(value) {
+    if (value !== 'on' && value !== 'off') throw new TypeError('action must be "on" or "off"');
+    return value;
+  }
+
+  function assertPositional(value, name, maxLength) {
+    const checked = assertString(value, name, maxLength);
+    if (checked.startsWith('-')) throw new TypeError(`${name} must not start with "-"`);
+    return checked;
+  }
+
+  async function inspectFolder(cwd) {
+    const safeCwd = path.resolve(assertString(cwd, 'cwd'));
+    const { stdout } = await runBrain(['inspect', '--cwd', safeCwd, '--json']);
+    return JSON.parse(stdout);
+  }
+
+  async function toggleSkill(payload = {}) {
+    const name = assertPositional(payload.name, 'skill name', 256);
+    const action = assertToggleAction(payload.action);
+    const safeCwd = path.resolve(assertString(payload.cwd, 'cwd'));
+    const args = ['skill', action, name, '--cwd', safeCwd];
+    if (payload.settings !== undefined) {
+      if (!['user', 'project', 'local'].includes(payload.settings)) {
+        throw new TypeError('settings must be "user", "project", or "local"');
+      }
+      args.push('--settings', payload.settings);
+    }
+    return serializeMutation(async () => {
+      await runBrain(args);
+      return inspectFolder(safeCwd);
+    });
+  }
+
+  async function toggleRule(payload = {}) {
+    const name = assertPositional(payload.name, 'rule name', 512);
+    const action = assertToggleAction(payload.action);
+    const safeCwd = path.resolve(assertString(payload.cwd, 'cwd'));
+    return serializeMutation(async () => {
+      await runBrain(['rule', action, name, '--cwd', safeCwd]);
+      return inspectFolder(safeCwd);
+    });
+  }
+
   function stop() {
     stopped = true;
     refreshQueued = false;
@@ -308,7 +352,8 @@ function createBrainService(brainRoot, options = {}) {
   return {
     root, readInventory, refresh, simulate, validate, explain, addProject,
     updateProject, projectDependencies, deleteProject, saveWorkflow, deleteWorkflow,
-    saveDomain, domainDependencies, deleteDomain, updateSkillScope, stop, isWithin
+    saveDomain, domainDependencies, deleteDomain, updateSkillScope,
+    inspectFolder, toggleSkill, toggleRule, stop, isWithin
   };
 }
 

@@ -63,6 +63,7 @@ function setView(view) {
     projects: ['PROJECT REGISTRY', 'Projects and their |real relationships.'],
     graph: ['KNOWLEDGE GRAPH', 'From domain — |to action.'],
     simulator: ['CONTEXT RESOLVER', 'Resolve context |before launch.'],
+    inspector: ['FOLDER INSPECTOR', 'What is mounted here — |and what should be.'],
     conflicts: ['COLLISION RADAR', 'Conflicts |without surprises.'],
     health: ['SYSTEM HEALTH', 'Trust, then |verify.']
   }[view];
@@ -659,6 +660,177 @@ function renderSimulation(result) {
   host.append(skillBox);
 }
 
+let inspectionRequest = 0;
+const inspectorState = { path: null, harness: null, skillFilter: '' };
+
+async function runInspection(cwd) {
+  const path = (cwd || $('#inspectorPath').value).trim();
+  if (!path || $('#inspectButton').disabled) return;
+  $('#inspectorPath').value = path;
+  const request = ++inspectionRequest;
+  const button = $('#inspectButton'); button.disabled = true; button.textContent = 'Inspecting…';
+  try {
+    const harness = await window.agentBrain.inspectFolder(path);
+    if (request !== inspectionRequest) return;
+    inspectorState.path = path; inspectorState.harness = harness;
+    renderInspector();
+  } catch (error) {
+    if (request === inspectionRequest) showNotice(error.message, true);
+  } finally {
+    if (request === inspectionRequest) { button.disabled = false; button.textContent = 'Inspect'; }
+  }
+}
+
+function harnessPanel(title, note) {
+  const section = element('section', 'panel harness-panel');
+  const head = element('div', 'panel-head');
+  head.append(element('h3', '', title), element('span', 'muted-chip', note));
+  section.append(head);
+  return section;
+}
+
+function harnessRow(title, description, badges, button) {
+  const row = element('div', 'harness-row');
+  const body = element('div');
+  const heading = element('span', 'harness-title', title);
+  body.append(heading);
+  if (badges.length) {
+    const group = element('span', 'harness-badges');
+    for (const [text, tone] of badges) group.append(element('span', `badge${tone ? ` ${tone}` : ''}`, text));
+    heading.after(group);
+  }
+  if (description) body.append(element('small', '', description));
+  row.append(body);
+  if (button) row.append(button);
+  return row;
+}
+
+function toggleButton(kind, name, action, label) {
+  const button = element('button', 'toggle-button', label);
+  button.dataset.kind = kind; button.dataset.name = name; button.dataset.action = action;
+  return button;
+}
+
+function renderInspectorSkills(host) {
+  clear(host);
+  const query = inspectorState.skillFilter.toLowerCase();
+  const skills = inspectorState.harness.skills.filter((skill) =>
+    !query || skill.listed_name.toLowerCase().includes(query) || (skill.description || '').toLowerCase().includes(query));
+  for (const skill of skills) {
+    const badges = [[skill.scope_level + (skill.scope_detail ? ` · ${skill.scope_detail}` : ''), '']];
+    if (skill.usage?.count) badges.push([`${skill.usage.count} calls`, '']);
+    if (skill.override.effective) badges.push([`${skill.override.effective} @ ${skill.override.level}`, skill.override.effective === 'off' ? 'warn' : 'ok']);
+    else if (!skill.active) badges.push(['out of context', '']);
+    const row = harnessRow(
+      skill.listed_name, skill.description, badges,
+      toggleButton('skill', skill.listed_name, skill.visible ? 'off' : 'on', skill.visible ? 'Off' : 'On')
+    );
+    row.classList.toggle('off', !skill.visible);
+    host.append(row);
+  }
+  if (!skills.length) host.append(element('div', 'empty-state', 'No skills match this filter.'));
+}
+
+function renderInspector() {
+  const { harness } = inspectorState;
+  const advice = harness.advice;
+  const host = $('#inspectorResult'); clear(host); host.className = 'inspector-result';
+
+  const chips = element('div', 'context-summary');
+  const context = harness.context;
+  for (const [label, value] of [
+    ['Domain', context.domain], ['Project', context.project?.name || '—'],
+    ['Source', context.source], ['Folder', harness.root]
+  ]) { const card = element('article', 'context-card'); card.append(element('span', '', label), element('strong', '', value)); chips.append(card); }
+  host.append(chips);
+
+  const recommended = advice.recommendations.filter((item) => item.status === 'recommended');
+  const advicePanel = harnessPanel('Worth enabling here', `${recommended.length} suggestions · from the code in this folder`);
+  if (advice.signals.length) {
+    const signals = element('div', 'tag-list');
+    for (const signal of advice.signals) signals.append(element('span', 'tag', `${signal.label} — ${signal.evidence}`));
+    advicePanel.append(signals);
+  }
+  for (const item of recommended) {
+    const row = harnessRow(item.listed_name, item.description, [], toggleButton('skill', item.listed_name, 'on', 'Enable'));
+    for (const reason of item.reasons) row.firstChild.append(element('small', 'reco-reason', reason));
+    advicePanel.append(row);
+  }
+  if (!recommended.length) advicePanel.append(element('p', 'inspector-note', advice.signals.length
+    ? 'Every installed skill matching this stack is already active.'
+    : 'No recognizable stack signals in this folder.'));
+  for (const gap of advice.gaps) advicePanel.append(element('p', 'inspector-gap', gap));
+  if (advice.cleanup.length) advicePanel.append(element('p', 'inspector-note', `Never used here: ${advice.cleanup.join(', ')}`));
+  host.append(advicePanel);
+
+  const active = harness.skills.filter((skill) => skill.visible).length;
+  const skillsPanel = harnessPanel('Skills', `${active} visible to the agent · ${harness.skills.length - active} off or out of context`);
+  const skillList = element('div', 'harness-list');
+  const filter = element('input', 'harness-filter');
+  filter.type = 'search'; filter.placeholder = 'Filter skills…'; filter.value = inspectorState.skillFilter;
+  filter.addEventListener('input', () => { inspectorState.skillFilter = filter.value; renderInspectorSkills(skillList); });
+  skillsPanel.append(filter, skillList);
+  renderInspectorSkills(skillList);
+  host.append(skillsPanel);
+
+  const rulesPanel = harnessPanel('Rules', `${harness.rules.filter((rule) => rule.enabled).length} on · ${harness.rules.filter((rule) => !rule.enabled).length} off`);
+  const ruleList = element('div', 'harness-list');
+  for (const rule of harness.rules) {
+    const row = harnessRow(rule.name, rule.title === rule.name ? rule.summary : rule.title,
+      [[rule.location, ''], [`${rule.lines} lines`, '']],
+      toggleButton('rule', rule.path, rule.enabled ? 'off' : 'on', rule.enabled ? 'Off' : 'On'));
+    row.classList.toggle('off', !rule.enabled);
+    ruleList.append(row);
+  }
+  if (!harness.rules.length) ruleList.append(element('div', 'empty-state', 'No rules directories found.'));
+  rulesPanel.append(ruleList);
+  host.append(rulesPanel);
+
+  const instructionsPanel = harnessPanel('Instruction files', `${harness.instructions.length} in the chain`);
+  const instructionList = element('div', 'harness-list');
+  for (const item of harness.instructions) {
+    instructionList.append(harnessRow(item.path, null, [[item.level, ''], [`${item.lines} lines`, '']], null));
+  }
+  if (!harness.instructions.length) instructionList.append(element('div', 'empty-state', 'No CLAUDE.md or AGENTS.md found on the path to home.'));
+  instructionsPanel.append(instructionList);
+  host.append(instructionsPanel);
+
+  const extrasPanel = harnessPanel('Agents · Hooks · MCP', 'read-only summary');
+  const extras = element('div', 'harness-list');
+  for (const agent of harness.agents) extras.append(harnessRow(agent.name, agent.description, [['agent', ''], [agent.location, '']], null));
+  for (const file of harness.settings_files) {
+    const hookEntries = Object.entries(file.hooks || {});
+    if (hookEntries.length) extras.append(harnessRow(file.path, null,
+      [['hooks', ''], [hookEntries.map(([event, count]) => `${event}:${count}`).join(' '), '']], null));
+  }
+  for (const server of harness.mcp) extras.append(harnessRow(server.name, null, [['mcp', ''], [server.transport, ''], [server.location, '']], null));
+  if (!extras.children.length) extras.append(element('div', 'empty-state', 'No agents, hooks, or MCP servers apply here.'));
+  extrasPanel.append(extras);
+  host.append(extrasPanel);
+}
+
+async function onInspectorToggle(event) {
+  const button = event.target.closest('button.toggle-button');
+  if (!button || !inspectorState.path) return;
+  const { kind, name, action } = button.dataset;
+  const path = inspectorState.path;
+  const request = inspectionRequest;
+  button.disabled = true;
+  try {
+    const payload = { name, action, cwd: path };
+    const harness = kind === 'rule'
+      ? await window.agentBrain.toggleRule(payload)
+      : await window.agentBrain.toggleSkill(payload);
+    if (request !== inspectionRequest || inspectorState.path !== path) return;
+    inspectorState.harness = harness;
+    renderInspector();
+    showNotice(`${kind === 'rule' ? 'Rule' : 'Skill'} ${name} turned ${action}.`);
+  } catch (error) {
+    showNotice(error.message, true);
+    button.disabled = false;
+  }
+}
+
 function renderConflicts() {
   const filtered = state.inventory.collisions.filter((item) => state.conflictFilter === 'all' || item.status === state.conflictFilter);
   $('#conflictCount').textContent = `${filtered.length} collisions`;
@@ -1115,6 +1287,10 @@ function bindEvents() {
   $('#projectFilters').addEventListener('click', (event) => { const button = event.target.closest('button'); if (!button) return; state.projectFilter = button.dataset.filter; syncFilterButtons('#projectFilters', state.projectFilter); renderProjects(); });
   $('#conflictFilters').addEventListener('click', (event) => { const button = event.target.closest('button'); if (!button) return; state.conflictFilter = button.dataset.filter; syncFilterButtons('#conflictFilters', state.conflictFilter); renderConflicts(); });
   $('#choosePath').addEventListener('click', async () => { const path = await window.agentBrain.chooseDirectory(); if (path) { $('#simulatorPath').value = path; runSimulation(); } });
+  $('#chooseInspectorPath').addEventListener('click', async () => { const path = await window.agentBrain.chooseDirectory(); if (path) runInspection(path); });
+  $('#inspectButton').addEventListener('click', () => runInspection());
+  $('#inspectorPath').addEventListener('keydown', (event) => { if (event.key === 'Enter') runInspection(); });
+  $('#inspectorResult').addEventListener('click', onInspectorToggle);
   $('#addProjectButton').addEventListener('click', openProjectDialog);
   $('#projectForm').addEventListener('submit', saveProject);
   $('#closeProjectDialog').addEventListener('click', () => $('#projectDialog').close());
@@ -1150,7 +1326,7 @@ function bindEvents() {
   $('#runHealth').addEventListener('click', runValidation); $('#validateButton').addEventListener('click', () => { const alreadyValidated = Boolean(state.validation); setView('health'); if (alreadyValidated) runValidation(); });
   $('#refreshButton').addEventListener('click', async () => { const button = $('#refreshButton'); button.classList.add('busy'); button.disabled = true; try { replaceInventory(await window.agentBrain.refresh()); setRuntimeStatus('online', 'Registry online'); showNotice('Registry refreshed.'); } catch (error) { setRuntimeStatus(state.inventory ? 'stale' : 'offline', state.inventory ? 'Registry stale' : 'Registry offline'); showNotice(error.message, true); } finally { button.classList.remove('busy'); button.disabled = false; } });
   $('#globalSearch').addEventListener('input', (event) => renderSearch(event.target.value));
-  document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { $('#searchOverlay').hidden = true; clearEdgeSelection(); } if (!state.inventory) return; if (event.metaKey && event.key.toLowerCase() === 'k') { event.preventDefault(); $('#globalSearch').focus(); } if (!event.metaKey && !event.ctrlKey && !event.altKey && /^[1-6]$/.test(event.key) && document.activeElement.tagName !== 'INPUT') { setView(['portfolio','projects','graph','simulator','conflicts','health'][Number(event.key)-1]); } });
+  document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { $('#searchOverlay').hidden = true; clearEdgeSelection(); } if (!state.inventory) return; if (event.metaKey && event.key.toLowerCase() === 'k') { event.preventDefault(); $('#globalSearch').focus(); } if (!event.metaKey && !event.ctrlKey && !event.altKey && /^[1-7]$/.test(event.key) && document.activeElement.tagName !== 'INPUT') { setView(['portfolio','projects','graph','simulator','inspector','conflicts','health'][Number(event.key)-1]); } });
   window.agentBrain.onInventoryUpdated((inventory) => { if (inventory.error) { setRuntimeStatus(state.inventory ? 'stale' : 'offline', state.inventory ? 'Registry stale' : 'Registry offline'); showNotice(inventory.error, true); } else { replaceInventory(inventory); setRuntimeStatus('online', 'Registry online'); showNotice('Manifest changes were loaded automatically.'); } });
 }
 

@@ -20,8 +20,9 @@
           <button class="nav-item" data-view="projects"><span>▦</span>Projects<kbd>2</kbd></button>
           <button class="nav-item" data-view="graph"><span>⌘</span>Graph<kbd>3</kbd></button>
           <button class="nav-item" data-view="simulator"><span>⌁</span>Simulator<kbd>4</kbd></button>
-          <button class="nav-item" data-view="conflicts"><span>△</span>Conflicts<kbd>5</kbd><b id="conflictBadge">—</b></button>
-          <button class="nav-item" data-view="health"><span>＋</span>Health<kbd>6</kbd></button>
+          <button class="nav-item" data-view="inspector"><span>⛭</span>Folder<kbd>5</kbd></button>
+          <button class="nav-item" data-view="conflicts"><span>△</span>Conflicts<kbd>6</kbd><b id="conflictBadge">—</b></button>
+          <button class="nav-item" data-view="health"><span>＋</span>Health<kbd>7</kbd></button>
         </nav>
 
         <div class="sidebar-spacer"></div>
@@ -108,6 +109,14 @@
             <div class="path-control"><input id="simulatorPath" type="text" spellcheck="false" aria-label="Path to simulate" placeholder="~/Projects/example"><button id="choosePath">Choose…</button><button id="simulateButton" class="primary">Resolve</button></div>
           </div>
           <div id="simulationResult" class="simulation-result empty-state">Choose a folder or paste a path.</div>
+        </section>
+
+        <section class="view" id="view-inspector">
+          <div class="simulator-hero">
+            <div><p class="eyebrow">FOLDER INSPECTOR</p><h2>What is mounted here?</h2><p>Skills, rules, instructions, agents, hooks, and MCP servers — with switches and advice based on the code.</p></div>
+            <div class="path-control"><input id="inspectorPath" type="text" spellcheck="false" aria-label="Folder to inspect" placeholder="~/Projects/example"><button id="chooseInspectorPath">Choose…</button><button id="inspectButton" class="primary">Inspect</button></div>
+          </div>
+          <div id="inspectorResult" class="inspector-result empty-state">Choose an application folder to see its agent harness.</div>
         </section>
 
         <section class="view" id="view-conflicts">

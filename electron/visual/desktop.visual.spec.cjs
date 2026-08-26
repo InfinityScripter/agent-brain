@@ -517,3 +517,25 @@ test('node inspector opens for domain, project, workflow, and core nodes', async
   await page.locator('[data-node-id="core"]').click();
   await expect(page.locator('#skillInspector')).toContainText('global skills');
 });
+
+test('folder inspector shows the harness and toggles a skill', async () => {
+  await page.getByRole('button', { name: /Folder/ }).click();
+  await page.locator('#inspectorPath').fill(fixture.paths['atlas-web']);
+  await page.locator('#inspectButton').click();
+  await expect(page.locator('#inspectorResult .context-card').first()).toContainText('Domain');
+  await expect(page.locator('.harness-panel').filter({ hasText: 'Instruction files' })).toContainText('AGENTS.md');
+
+  const skillRow = () => page.locator('.harness-row').filter({ hasText: 'frontend-review' }).first();
+  await expect(skillRow()).toBeVisible();
+  await skillRow().getByRole('button', { name: 'Off' }).click();
+  await expect(skillRow()).toContainText('off @ local');
+
+  const settingsPath = path.join(fixture.paths['atlas-web'], '.claude', 'settings.local.json');
+  const settings = JSON.parse(await fs.readFile(settingsPath, 'utf8'));
+  expect(settings.skillOverrides['frontend-review']).toBe('off');
+
+  await skillRow().getByRole('button', { name: 'On' }).click();
+  await expect(skillRow()).toContainText('on @ local');
+  const restored = JSON.parse(await fs.readFile(settingsPath, 'utf8'));
+  expect(restored.skillOverrides['frontend-review']).toBe('on');
+});
