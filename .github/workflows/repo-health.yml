@@ -63,7 +63,7 @@ jobs:
         run: npm outdated
 
       - name: Report results
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           RESULTS: |
             {
