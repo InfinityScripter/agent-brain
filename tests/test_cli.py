@@ -22,6 +22,15 @@ class AgentBrainCliTests(unittest.TestCase):
             text=True,
         )
 
+    def test_version_flag_matches_package_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            registry = home / ".agent-brain"
+            result = self.run_brain(home, registry, "--version")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            package_version = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["version"]
+            self.assertEqual(result.stdout.strip(), f"agent-brain {package_version}")
+
     def test_clean_init_validate_and_project_add(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

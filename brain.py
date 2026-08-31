@@ -27,6 +27,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
+# Must match "version" in package.json; scripts/public-release-check.cjs
+# fails the release gate when the two drift apart.
+__version__ = "1.3.0"
+
 ENGINE_DIR = Path(__file__).resolve().parent
 DEFAULTS_DIR = ENGINE_DIR / "defaults"
 DEFAULT_REGISTRY_DIR = (
@@ -1016,7 +1020,9 @@ def toggle_skill(name: str, action: str, settings_path: Path, inventory: Dict[st
         try:
             settings = read_json(settings_path)
         except (OSError, ValueError, json.JSONDecodeError) as error:
-            raise ValueError(f"Cannot parse {settings_path} ({error}); fix or remove it before toggling.")
+            raise ValueError(
+                f"Cannot parse {settings_path} ({error}); fix or remove it before toggling."
+            ) from error
         if not isinstance(settings, dict):
             raise ValueError(f"{settings_path} is not a JSON object; refusing to overwrite it.")
     else:
@@ -1235,7 +1241,7 @@ def skill_id(name: str, scope: Dict[str, Optional[str]]) -> str:
     if level == "plugin":
         return f"plugin.{slug(scope.get('plugin') or 'unknown')}.{suffix}"
     if level == "archive":
-        digest = hashlib.sha1(str(scope).encode("utf-8")).hexdigest()[:7]
+        digest = hashlib.sha1(str(scope).encode("utf-8"), usedforsecurity=False).hexdigest()[:7]
         return f"archive.{suffix}.{digest}"
     return f"global.{suffix}"
 
@@ -1362,7 +1368,8 @@ def merge_skills(
         identifier = skill_id(name, scope)
         used_ids[identifier] += 1
         if used_ids[identifier] > 1:
-            identifier = f"{identifier}.{hashlib.sha1(source_path.encode('utf-8')).hexdigest()[:7]}"
+            digest = hashlib.sha1(source_path.encode("utf-8"), usedforsecurity=False).hexdigest()[:7]
+            identifier = f"{identifier}.{digest}"
 
         runtimes = sorted({item["runtime"] for item in mounts})
         mount_paths = sorted({item["mount_path"] for item in mounts})
@@ -2936,7 +2943,7 @@ def command_explain(args: argparse.Namespace) -> int:
         print(f"Reason:   {result['reason']}")
         print(f"Source:   {selected['source_path']}")
     else:
-        print(f"Selected: none")
+        print("Selected: none")
         print(f"Reason:   {result['reason']}")
     print("Candidates:")
     active_ids = set(status["active_skills"])
@@ -3107,6 +3114,11 @@ def command_serve(args: argparse.Namespace) -> int:
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Agent Brain context registry")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"agent-brain {__version__}",
+    )
     parser.add_argument(
         "--registry",
         default=os.environ.get("AGENT_BRAIN_HOME", str(DEFAULT_REGISTRY_DIR)),

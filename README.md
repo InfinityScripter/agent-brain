@@ -214,6 +214,7 @@ or skill contents.
 ```bash
 python3 -m unittest discover -s tests -v
 npm test
+npm run lint
 npm run test:visual
 ./bin/brain validate
 npm run package:universal
@@ -222,6 +223,14 @@ npm run make:universal
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the release and privacy gates.
+
+## Self-maintenance
+
+The repository maintains itself through three automated loops — Dependabot
+for dependencies, a weekly repo-health pass that opens issues when any check
+goes red, and a weekly self-improvement round where Claude Code proposes one
+reviewed improvement as a draft PR. Nothing merges without CI and a human.
+See [docs/self-improvement.md](docs/self-improvement.md).
 
 ## License
 

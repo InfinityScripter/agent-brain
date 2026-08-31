@@ -1,0 +1,130 @@
+name: Repo health
+
+# Weekly full health pass over the repository. Every check runs even when an
+# earlier one fails; the results land in the run summary, and a scheduled
+# failure opens (or updates) a "repo-health" issue so the self-improvement
+# workflow and human maintainers both see what needs attention.
+
+on:
+  schedule:
+    - cron: '17 5 * * 1' # Mondays 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm ci --ignore-scripts
+      - run: pip install ruff==0.15.8
+
+      - id: lint
+        name: ruff check
+        continue-on-error: true
+        run: ruff check .
+      - id: shellcheck
+        name: shellcheck
+        continue-on-error: true
+        run: shellcheck bin/brain bin/agent-brain-app 'Open Agent Brain.command'
+      - id: python
+        name: Python unit tests
+        continue-on-error: true
+        run: python -m unittest discover -s tests
+      - id: node
+        name: Node tests
+        continue-on-error: true
+        run: npm test
+      - id: audit
+        name: npm audit (production)
+        continue-on-error: true
+        run: npm audit --omit=dev
+      - id: public
+        name: Public release gate
+        continue-on-error: true
+        run: npm run test:public
+      - id: outdated
+        name: npm outdated (informational)
+        continue-on-error: true
+        run: npm outdated
+
+      - name: Report results
+        uses: actions/github-script@v7
+        env:
+          RESULTS: |
+            {
+              "ruff check": "${{ steps.lint.outcome }}",
+              "shellcheck": "${{ steps.shellcheck.outcome }}",
+              "Python unit tests": "${{ steps.python.outcome }}",
+              "Node tests": "${{ steps.node.outcome }}",
+              "npm audit (production)": "${{ steps.audit.outcome }}",
+              "Public release gate": "${{ steps.public.outcome }}"
+            }
+          OUTDATED: ${{ steps.outdated.outcome }}
+        with:
+          script: |
+            const results = JSON.parse(process.env.RESULTS);
+            const failures = Object.entries(results).filter(([, outcome]) => outcome !== 'success');
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const lines = Object.entries(results).map(
+              ([name, outcome]) => `- ${outcome === 'success' ? '✅' : '❌'} ${name}`
+            );
+            if (process.env.OUTDATED !== 'success') {
+              lines.push('- ℹ️ `npm outdated` reports stale dependencies (informational; Dependabot handles upgrades)');
+            }
+            const report = lines.join('\n');
+            await core.summary.addHeading('Repo health').addRaw(report, true).write();
+
+            const label = 'repo-health';
+            const title = 'Repo health: scheduled checks are failing';
+            const open = await github.rest.issues.listForRepo({
+              ...context.repo, state: 'open', labels: label,
+            });
+            const existing = open.data.find((issue) => issue.title === title);
+
+            if (failures.length === 0) {
+              if (existing) {
+                await github.rest.issues.createComment({
+                  ...context.repo, issue_number: existing.number,
+                  body: `All health checks pass again ([run](${runUrl})). Closing.`,
+                });
+                await github.rest.issues.update({
+                  ...context.repo, issue_number: existing.number, state: 'closed',
+                });
+              }
+              return;
+            }
+
+            const body = [
+              `The scheduled health pass found failing checks ([run](${runUrl})):`,
+              '',
+              report,
+              '',
+              'Fixing these is the top priority for the next self-improvement round',
+              '(see `docs/self-improvement.md`).',
+            ].join('\n');
+            if (existing) {
+              await github.rest.issues.update({
+                ...context.repo, issue_number: existing.number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                ...context.repo, title, body, labels: [label],
+              });
+            }
+            core.setFailed(`${failures.length} health check(s) failing`);

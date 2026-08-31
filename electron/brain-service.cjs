@@ -93,23 +93,23 @@ function createBrainService(brainRoot, options = {}) {
   }
 
   async function parseInventory() {
-      const inventory = JSON.parse(await fs.readFile(inventoryPath, 'utf8'));
-      if (
-        inventory?.schema_version !== 'agent-brain.registry.v1'
-        || !Array.isArray(inventory.domains)
-        || !Array.isArray(inventory.projects)
-        || !Array.isArray(inventory.workflows)
-        || !Array.isArray(inventory.skills)
-        || !Array.isArray(inventory.collisions)
-        || !Array.isArray(inventory.instructions)
-        || !inventory.stats
-        || typeof inventory.stats !== 'object'
-        || !inventory.stats.scope_counts
-        || typeof inventory.stats.scope_counts !== 'object'
-      ) {
-        throw new TypeError('Agent Brain inventory has an invalid shape');
-      }
-      return inventory;
+    const inventory = JSON.parse(await fs.readFile(inventoryPath, 'utf8'));
+    if (
+      inventory?.schema_version !== 'agent-brain.registry.v1'
+      || !Array.isArray(inventory.domains)
+      || !Array.isArray(inventory.projects)
+      || !Array.isArray(inventory.workflows)
+      || !Array.isArray(inventory.skills)
+      || !Array.isArray(inventory.collisions)
+      || !Array.isArray(inventory.instructions)
+      || !inventory.stats
+      || typeof inventory.stats !== 'object'
+      || !inventory.stats.scope_counts
+      || typeof inventory.stats.scope_counts !== 'object'
+    ) {
+      throw new TypeError('Agent Brain inventory has an invalid shape');
+    }
+    return inventory;
   }
 
   async function readInventory() {

@@ -17,6 +17,7 @@
   "homepage": "https://github.com/InfinityScripter/agent-brain#readme",
   "scripts": {
     "start": "electron-forge start",
+    "lint": "ruff check . && shellcheck bin/brain bin/agent-brain-app 'Open Agent Brain.command'",
     "test": "node --test electron/test/*.test.cjs",
     "test:visual": "playwright test --config=playwright.config.cjs",
     "test:visual:update": "playwright test --config=playwright.config.cjs --update-snapshots=all",

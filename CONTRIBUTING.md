@@ -14,11 +14,17 @@ AGENT_BRAIN_HOME=/tmp/agent-brain-dev npm start
 ## Required checks
 
 ```bash
+npm run lint
 npm run test:python
 npm test
 npm run test:visual
 npm run test:public
 ```
+
+`npm run lint` needs `ruff` (`pip install ruff`) and, for the launcher
+scripts, `shellcheck`; the ruff rule set lives in `pyproject.toml`. CI also
+runs the Python suite on 3.9 (the documented floor), 3.12, and 3.13 —
+keep `brain.py` and the tests compatible with Python 3.9.
 
 Visual regression tests launch the real Electron renderer against a synthetic,
 deterministic registry and compare seventeen key UI states with reviewed PNG

@@ -1,0 +1,106 @@
+name: Self-improve
+
+# Weekly autonomous improvement round. Claude Code reviews the repository,
+# picks ONE high-value improvement, implements it behind the full local test
+# gates, and opens a draft pull request for human review. CI and the visual
+# suite then judge the change like any other contribution — the loop never
+# merges anything by itself.
+#
+# Requires the ANTHROPIC_API_KEY repository secret; without it the run
+# skips quietly. See docs/self-improvement.md for the full loop and setup.
+
+on:
+  schedule:
+    - cron: '23 6 * * 3' # Wednesdays 06:23 UTC
+  workflow_dispatch:
+    inputs:
+      focus:
+        description: Optional focus for this round (e.g. "test coverage of toggle_rule")
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    if: github.repository == 'InfinityScripter/agent-brain'
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "ANTHROPIC_API_KEY secret is not set; skipping the improvement round." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  improve:
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm ci --ignore-scripts
+      - run: pip install ruff==0.15.8
+
+      - name: Run improvement round
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: >-
+            --max-turns 120
+            --allowedTools "Bash(git:*),Bash(gh:*),Bash(npm:*),Bash(node:*),Bash(python3:*),Bash(python:*),Bash(ruff:*),Bash(shellcheck:*),Bash(./bin/brain:*)"
+          prompt: |
+            You are the maintenance agent for this repository. Run one
+            self-improvement round, end to end, following
+            docs/self-improvement.md, AGENTS.md, and CONTRIBUTING.md.
+
+            Focus requested by the maintainer for this round (may be empty):
+            "${{ inputs.focus }}"
+
+            1. If `gh pr list --state open --search "auto-improve in:title"`
+               shows an open auto-improve PR, stop: one round at a time.
+            2. Pick ONE improvement, in this priority order:
+               a. an open issue labeled `repo-health` (failing checks);
+               b. an open issue labeled `auto-improve` (maintainer requests);
+               c. the maintainer focus above, if given;
+               d. otherwise your own review: a real bug, a test-coverage gap,
+                  documentation drift, or a small performance/DX win.
+               Prefer small, verifiable, high-value changes.
+            3. Implement it on a new branch named `auto-improve/<short-slug>`.
+               Never weaken the Electron sandbox, the IPC checks, the privacy
+               gates, or the test suites; never commit registry data or
+               update visual snapshots (they are reviewed on macOS only).
+            4. Verify before pushing — all of these must pass locally:
+               `ruff check .`, `python3 -m unittest discover -s tests`,
+               `npm test`, `npm run test:public`.
+            5. Push the branch and open a DRAFT pull request titled
+               `auto-improve: <summary>` that explains the change, the
+               motivation, and the verification commands you ran. If the
+               round fixed a `repo-health` or `auto-improve` issue, link it
+               with `Closes #<n>`.
+            6. If nothing is genuinely worth changing, stop without a PR and
+               say so in your final message.

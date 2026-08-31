@@ -13,6 +13,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install ruff==0.15.8
+      - run: ruff check .
+      - run: shellcheck bin/brain bin/agent-brain-app 'Open Agent Brain.command'
+      - name: Syntax-check Node sources
+        run: git ls-files '*.cjs' '*.js' -z | xargs -0 -n1 node --check
+
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the documented floor (README), 3.13 the latest stable.
+        python-version: ['3.9', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m unittest discover -s tests -v
+      - name: CLI smoke — init, build, validate
+        run: |
+          ./bin/brain --registry "$RUNNER_TEMP/registry" init
+          ./bin/brain --registry "$RUNNER_TEMP/registry" build
+          ./bin/brain --registry "$RUNNER_TEMP/registry" validate
+
   test:
     runs-on: ubuntu-latest
     steps:
