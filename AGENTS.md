@@ -17,4 +17,10 @@
   not a second routing implementation.
 - Run `python3 -m unittest discover -s tests -v`, `bin/brain validate`, and
   `bin/brain build` after changing routing or generation code. Run `npm test`
-  and `npm run package` after changing the Electron application.
+  and `npm run package` after changing the Electron application. Run
+  `ruff check .` (configured in `pyproject.toml`) after changing Python code;
+  keep it compatible with Python 3.9.
+- `__version__` in `brain.py` must stay equal to `version` in `package.json`;
+  `npm run test:public` enforces this.
+- Automation may propose changes (see `docs/self-improvement.md`) but must
+  follow every rule above and leave merging to a human.

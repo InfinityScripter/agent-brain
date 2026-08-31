@@ -5,7 +5,7 @@ const { spawnSync } = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
 const publicEntries = [
-  '.github', '.gitignore', 'AGENTS.md', 'CONTRIBUTING.md', 'LICENSE', 'README.md',
+  '.editorconfig', '.github', '.gitignore', 'AGENTS.md', 'CONTRIBUTING.md', 'LICENSE', 'README.md', 'pyproject.toml',
   'SECURITY.md', 'THIRD_PARTY_NOTICES.md', 'Open Agent Brain.command', 'adapters', 'assets', 'bin', 'brain.py',
   'core', 'defaults', 'desktop', 'docs', 'electron', 'forge.config.cjs', 'package-lock.json',
   'package.json', 'registry', 'scripts', 'skills', 'tests', 'web'
@@ -64,6 +64,11 @@ for (const file of files) {
     assert.equal(contents.includes(pattern), false, `${label} found in ${file}`);
   }
 }
+
+const packageVersion = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version;
+const brainSource = fs.readFileSync(path.join(root, 'brain.py'), 'utf8');
+const brainVersion = brainSource.match(/^__version__ = "([^"]+)"$/m)?.[1];
+assert.equal(brainVersion, packageVersion, `brain.py __version__ (${brainVersion}) must match package.json version (${packageVersion})`);
 
 const lockfile = fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8');
 assert.match(lockfile, /https:\/\/registry\.npmjs\.org\//, 'package-lock does not use the public npm registry');
