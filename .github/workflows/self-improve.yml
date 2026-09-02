@@ -6,8 +6,11 @@ name: Self-improve
 # suite then judge the change like any other contribution — the loop never
 # merges anything by itself.
 #
-# Requires the ANTHROPIC_API_KEY repository secret; without it the run
-# skips quietly. See docs/self-improvement.md for the full loop and setup.
+# Authentication: either the CLAUDE_CODE_OAUTH_TOKEN secret (a Claude
+# subscription token from `claude setup-token`) or the ANTHROPIC_API_KEY
+# secret (Claude Console, API billing). Without both the run skips quietly.
+# GitHub access comes from the Claude GitHub App, so its pushes and PRs
+# trigger CI like a human's would. See docs/self-improvement.md.
 
 on:
   schedule:
@@ -31,13 +34,14 @@ jobs:
     steps:
       - id: check
         env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          if [ -n "$ANTHROPIC_API_KEY" ]; then
+          if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || [ -n "$ANTHROPIC_API_KEY" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "ANTHROPIC_API_KEY secret is not set; skipping the improvement round." >> "$GITHUB_STEP_SUMMARY"
+            echo "Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set; skipping the improvement round." >> "$GITHUB_STEP_SUMMARY"
           fi
 
   improve:
@@ -66,13 +70,12 @@ jobs:
 
       - name: Run improvement round
         uses: anthropics/claude-code-action@v1
-        env:
-          GH_TOKEN: ${{ github.token }}
         with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: >-
             --max-turns 120
-            --allowedTools "Bash(git:*),Bash(gh:*),Bash(npm:*),Bash(node:*),Bash(python3:*),Bash(python:*),Bash(ruff:*),Bash(shellcheck:*),Bash(./bin/brain:*)"
+            --allowedTools "mcp__github__create_pull_request,Bash(git:*),Bash(gh:*),Bash(npm:*),Bash(node:*),Bash(python3:*),Bash(python:*),Bash(ruff:*),Bash(shellcheck:*),Bash(./bin/brain:*)"
           prompt: |
             You are the maintenance agent for this repository. Run one
             self-improvement round, end to end, following
@@ -98,9 +101,11 @@ jobs:
                `ruff check .`, `python3 -m unittest discover -s tests`,
                `npm test`, `npm run test:public`.
             5. Push the branch and open a DRAFT pull request titled
-               `auto-improve: <summary>` that explains the change, the
-               motivation, and the verification commands you ran. If the
-               round fixed a `repo-health` or `auto-improve` issue, link it
-               with `Closes #<n>`.
+               `auto-improve: <summary>` with the `mcp__github__create_pull_request`
+               tool (fall back to `gh pr create --draft` if the tool is
+               unavailable). Explain the change, the motivation, and the
+               verification commands you ran. If the round fixed a
+               `repo-health` or `auto-improve` issue, link it with
+               `Closes #<n>`.
             6. If nothing is genuinely worth changing, stop without a PR and
                say so in your final message.
