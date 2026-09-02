@@ -36,6 +36,6 @@
     "@electron-forge/plugin-fuses": "7.11.2",
     "@electron/fuses": "1.8.0",
     "@playwright/test": "1.62.1",
-    "electron": "43.4.0"
+    "electron": "44.0.0"
   }
 }
