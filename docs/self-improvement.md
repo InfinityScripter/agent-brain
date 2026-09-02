@@ -59,13 +59,33 @@ Guardrails, enforced by the prompt and by review:
 
 ## Setup
 
-The pipeline needs two one-time repository settings:
+Dependabot and repo-health need nothing. The self-improve loop needs two
+one-time steps; without them it skips quietly.
 
-1. **Secret** — add `ANTHROPIC_API_KEY` under *Settings → Secrets and
-   variables → Actions*. Without it the self-improve workflow skips quietly;
-   Dependabot and repo-health keep working.
-2. **Actions may open PRs** — enable *Settings → Actions → General → Allow
-   GitHub Actions to create and approve pull requests*.
+1. **Install the [Claude GitHub App](https://github.com/apps/claude)** on the
+   repository. The action authenticates to GitHub as this app, so the
+   branches and pull requests it creates trigger CI like a human's would.
+   (Pushes made with the workflow's own `GITHUB_TOKEN` would not — GitHub
+   suppresses workflow runs for them to prevent loops.)
+2. **Add one authentication secret** under *Settings → Secrets and
+   variables → Actions*:
+   - `CLAUDE_CODE_OAUTH_TOKEN` — bills your Claude subscription (Pro, Max,
+     Team, or Enterprise). Generate it locally with `claude setup-token`;
+     it is valid for one year and can only make model requests. The token
+     is tied to the person who generated it, so it fits a personal
+     repository; for a shared organization secret use an API key instead.
+   - `ANTHROPIC_API_KEY` — a Claude Console key, billed per token.
+
+   The fastest path is `/install-github-app` inside a local `claude`
+   session in this repository: it installs the app and stores the secret
+   for you (skip its workflow-file step; this repository already has one).
+
+Scheduled runs are attributed to the account that last edited the `cron`
+line, and the action refuses to run for bot accounts. If the first
+scheduled run is rejected for that reason, edit the `cron` line once from
+your own account (the GitHub web editor is enough); manual runs from the
+Actions tab are unaffected. GitHub also pauses schedules in public
+repositories after 60 days without activity.
 
 To request a specific improvement, open an issue and label it
 `auto-improve`, or run the *Self-improve* workflow manually with a `focus`
