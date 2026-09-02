@@ -154,6 +154,13 @@ class AgentBrainCliTests(unittest.TestCase):
             self.assertTrue(style["enabled"])
             self.assertEqual(style["location"], "user")
 
+            inspected_text = self.run_brain(home, registry, "inspect", "--cwd", str(project))
+            self.assertEqual(inspected_text.returncode, 0, inspected_text.stderr)
+            self.assertIn("Folder: ", inspected_text.stdout)
+            self.assertIn("react-best-practices", inspected_text.stdout)
+            self.assertIn("Rules (1):", inspected_text.stdout)
+            self.assertIn("[on ] style", inspected_text.stdout)
+
             toggled = self.run_brain(home, registry, "skill", "off", "react-best-practices", "--cwd", str(project))
             self.assertEqual(toggled.returncode, 0, toggled.stderr)
             local_settings = json.loads(
@@ -182,6 +189,13 @@ class AgentBrainCliTests(unittest.TestCase):
             self.assertEqual(react_advice["status"], "recommended")
             self.assertTrue(any("react" in reason for reason in react_advice["reasons"]))
             self.assertTrue(any("CLAUDE.md" in gap for gap in advice["gaps"]))
+
+            recommended_text = self.run_brain(home, registry, "recommend", "--cwd", str(project))
+            self.assertEqual(recommended_text.returncode, 0, recommended_text.stderr)
+            self.assertIn("Detected in the code:", recommended_text.stdout)
+            self.assertIn("Worth enabling here:", recommended_text.stdout)
+            self.assertIn("react-best-practices", recommended_text.stdout)
+            self.assertIn("Gap: ", recommended_text.stdout)
 
             unknown = self.run_brain(home, registry, "skill", "off", "ghost", "--cwd", str(project))
             self.assertEqual(unknown.returncode, 2)
