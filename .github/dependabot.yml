@@ -6,6 +6,12 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    ignore:
+      # @electron-forge/plugin-fuses 7.x pins a peer dependency on
+      # @electron/fuses ^1.0.0; a 2.x bump fails `npm ci` with ERESOLVE.
+      # Remove once the Forge plugin accepts fuses v2.
+      - dependency-name: "@electron/fuses"
+        update-types: ["version-update:semver-major"]
     groups:
       electron-forge:
         patterns:
