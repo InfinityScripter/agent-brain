@@ -68,8 +68,11 @@ jobs:
       id-token: write
       actions: read
     env:
+      # No subagents: a headless run ends the moment the main agent's turn
+      # ends, so work delegated to a background agent is silently lost.
       CLAUDE_ARGS: >-
         --max-turns 120
+        --disallowedTools "Agent,ScheduleWakeup"
         --allowedTools "mcp__github__create_pull_request,Bash(git:*),Bash(gh:*),Bash(npm:*),Bash(node:*),Bash(python3:*),Bash(python:*),Bash(ruff:*),Bash(shellcheck:*),Bash(./bin/brain:*)"
     steps:
       - uses: actions/checkout@v6
@@ -117,6 +120,14 @@ jobs:
           You are the maintenance agent for this repository. Run one
           self-improvement round, end to end, following
           docs/self-improvement.md, AGENTS.md, and CONTRIBUTING.md.
+
+          This is a single, non-interactive CI run: nobody will answer you,
+          no notification will ever arrive, and the job ends the moment
+          your turn ends. Do every step yourself, in the foreground, and end
+          your turn only after the pull request is open (or after you have
+          decided, with reasons, that nothing is worth changing). Never
+          delegate to background subagents, never schedule wake-ups, never
+          "wait" for anything.
 
           EOF
             echo "Focus requested by the maintainer for this round (may be empty):"
