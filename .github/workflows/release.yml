@@ -51,7 +51,7 @@ jobs:
           cd out/make
           shasum -a 256 "Agent Brain.dmg" > SHA256SUMS
           shasum -c SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agent-brain-macos-universal
           path: |
