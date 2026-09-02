@@ -9,6 +9,10 @@ name: Self-improve
 # Authentication: either the CLAUDE_CODE_OAUTH_TOKEN secret (a Claude
 # subscription token from `claude setup-token`) or the ANTHROPIC_API_KEY
 # secret (Claude Console, API billing). Without both the run skips quietly.
+# The two credentials are passed in separate, mutually exclusive steps: an
+# empty `anthropic_api_key` input is exported as an empty ANTHROPIC_API_KEY
+# variable, which outranks the OAuth token inside Claude Code and makes the
+# run fail before its first request.
 # GitHub access comes from the Claude GitHub App, so its pushes and PRs
 # trigger CI like a human's would. See docs/self-improvement.md.
 
@@ -30,23 +34,25 @@ jobs:
     if: github.repository == 'InfinityScripter/agent-brain'
     runs-on: ubuntu-latest
     outputs:
-      enabled: ${{ steps.check.outputs.enabled }}
+      auth: ${{ steps.check.outputs.auth }}
     steps:
       - id: check
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || [ -n "$ANTHROPIC_API_KEY" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "auth=oauth" >> "$GITHUB_OUTPUT"
+          elif [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "auth=api_key" >> "$GITHUB_OUTPUT"
           else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "auth=none" >> "$GITHUB_OUTPUT"
             echo "Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set; skipping the improvement round." >> "$GITHUB_STEP_SUMMARY"
           fi
 
   improve:
     needs: gate
-    if: needs.gate.outputs.enabled == 'true'
+    if: needs.gate.outputs.auth != 'none'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -54,6 +60,10 @@ jobs:
       issues: write
       id-token: write
       actions: read
+    env:
+      CLAUDE_ARGS: >-
+        --max-turns 120
+        --allowedTools "mcp__github__create_pull_request,Bash(git:*),Bash(gh:*),Bash(npm:*),Bash(node:*),Bash(python3:*),Bash(python:*),Bash(ruff:*),Bash(shellcheck:*),Bash(./bin/brain:*)"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -68,44 +78,67 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: pip install ruff==0.15.8
 
-      - name: Run improvement round
+      # The prompt is assembled once here so both authentication variants
+      # below run the identical round. Quoted heredoc: no shell expansion of
+      # the backticks and `$` inside the prompt text.
+      - id: prompt
+        name: Assemble the round prompt
+        env:
+          FOCUS: ${{ inputs.focus }}
+        run: |
+          {
+            echo 'text<<PROMPT_EOF'
+            cat <<'EOF'
+          You are the maintenance agent for this repository. Run one
+          self-improvement round, end to end, following
+          docs/self-improvement.md, AGENTS.md, and CONTRIBUTING.md.
+
+          EOF
+            echo "Focus requested by the maintainer for this round (may be empty):"
+            echo "\"$FOCUS\""
+            cat <<'EOF'
+
+          1. If `gh pr list --state open --search "auto-improve in:title"`
+             shows an open auto-improve PR, stop: one round at a time.
+          2. Pick ONE improvement, in this priority order:
+             a. an open issue labeled `repo-health` (failing checks);
+             b. an open issue labeled `auto-improve` (maintainer requests);
+             c. the maintainer focus above, if given;
+             d. otherwise your own review: a real bug, a test-coverage gap,
+                documentation drift, or a small performance/DX win.
+             Prefer small, verifiable, high-value changes.
+          3. Implement it on a new branch named `auto-improve/<short-slug>`.
+             Never weaken the Electron sandbox, the IPC checks, the privacy
+             gates, or the test suites; never commit registry data or
+             update visual snapshots (they are reviewed on macOS only).
+          4. Verify before pushing — all of these must pass locally:
+             `ruff check .`, `python3 -m unittest discover -s tests`,
+             `npm test`, `npm run test:public`.
+          5. Push the branch and open a DRAFT pull request titled
+             `auto-improve: <summary>` with the `mcp__github__create_pull_request`
+             tool (fall back to `gh pr create --draft` if the tool is
+             unavailable). Explain the change, the motivation, and the
+             verification commands you ran. If the round fixed a
+             `repo-health` or `auto-improve` issue, link it with
+             `Closes #<n>`.
+          6. If nothing is genuinely worth changing, stop without a PR and
+             say so in your final message.
+          EOF
+            echo 'PROMPT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run improvement round (Claude subscription)
+        if: needs.gate.outputs.auth == 'oauth'
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: ${{ env.CLAUDE_ARGS }}
+          prompt: ${{ steps.prompt.outputs.text }}
+
+      - name: Run improvement round (Claude API key)
+        if: needs.gate.outputs.auth == 'api_key'
+        uses: anthropics/claude-code-action@v1
+        with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_args: >-
-            --max-turns 120
-            --allowedTools "mcp__github__create_pull_request,Bash(git:*),Bash(gh:*),Bash(npm:*),Bash(node:*),Bash(python3:*),Bash(python:*),Bash(ruff:*),Bash(shellcheck:*),Bash(./bin/brain:*)"
-          prompt: |
-            You are the maintenance agent for this repository. Run one
-            self-improvement round, end to end, following
-            docs/self-improvement.md, AGENTS.md, and CONTRIBUTING.md.
-
-            Focus requested by the maintainer for this round (may be empty):
-            "${{ inputs.focus }}"
-
-            1. If `gh pr list --state open --search "auto-improve in:title"`
-               shows an open auto-improve PR, stop: one round at a time.
-            2. Pick ONE improvement, in this priority order:
-               a. an open issue labeled `repo-health` (failing checks);
-               b. an open issue labeled `auto-improve` (maintainer requests);
-               c. the maintainer focus above, if given;
-               d. otherwise your own review: a real bug, a test-coverage gap,
-                  documentation drift, or a small performance/DX win.
-               Prefer small, verifiable, high-value changes.
-            3. Implement it on a new branch named `auto-improve/<short-slug>`.
-               Never weaken the Electron sandbox, the IPC checks, the privacy
-               gates, or the test suites; never commit registry data or
-               update visual snapshots (they are reviewed on macOS only).
-            4. Verify before pushing — all of these must pass locally:
-               `ruff check .`, `python3 -m unittest discover -s tests`,
-               `npm test`, `npm run test:public`.
-            5. Push the branch and open a DRAFT pull request titled
-               `auto-improve: <summary>` with the `mcp__github__create_pull_request`
-               tool (fall back to `gh pr create --draft` if the tool is
-               unavailable). Explain the change, the motivation, and the
-               verification commands you ran. If the round fixed a
-               `repo-health` or `auto-improve` issue, link it with
-               `Closes #<n>`.
-            6. If nothing is genuinely worth changing, stop without a PR and
-               say so in your final message.
+          claude_args: ${{ env.CLAUDE_ARGS }}
+          prompt: ${{ steps.prompt.outputs.text }}
