@@ -10,8 +10,11 @@ name: Self-improve
 # subscription token from `claude setup-token`) or the ANTHROPIC_API_KEY
 # secret (Claude Console, API billing). Without both the run skips quietly.
 # The two credentials run in separate, mutually exclusive steps so each
-# variant passes only its own credential. A manual run with `debug: true`
-# prints Claude's full output, which the action otherwise hides.
+# variant passes only its own credential. Whitespace and line breaks are
+# stripped from the secret first: a token copied from a wrapped terminal
+# line arrives with a newline at column 80 and is rejected as-is. A manual
+# run with `debug: true` prints Claude's full output, which the action
+# otherwise hides.
 # GitHub access comes from the Claude GitHub App, so its pushes and PRs
 # trigger CI like a human's would. See docs/self-improvement.md.
 
@@ -82,6 +85,24 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: pip install ruff==0.15.8
 
+      # Secrets pasted from a terminal often carry a wrapped line break or a
+      # trailing newline; Claude Code rejects such a header value outright.
+      # Normalise here and re-mask the cleaned value so it never reaches logs.
+      - id: creds
+        name: Normalise credentials
+        env:
+          OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          oauth=$(printf '%s' "$OAUTH_TOKEN" | tr -d '[:space:]')
+          api_key=$(printf '%s' "$API_KEY" | tr -d '[:space:]')
+          if [ -n "$oauth" ]; then echo "::add-mask::$oauth"; fi
+          if [ -n "$api_key" ]; then echo "::add-mask::$api_key"; fi
+          {
+            echo "oauth=$oauth"
+            echo "api_key=$api_key"
+          } >> "$GITHUB_OUTPUT"
+
       # The prompt is assembled once here so both authentication variants
       # below run the identical round. Quoted heredoc: no shell expansion of
       # the backticks and `$` inside the prompt text.
@@ -135,7 +156,7 @@ jobs:
         if: needs.gate.outputs.auth == 'oauth'
         uses: anthropics/claude-code-action@v1
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_code_oauth_token: ${{ steps.creds.outputs.oauth }}
           claude_args: ${{ env.CLAUDE_ARGS }}
           prompt: ${{ steps.prompt.outputs.text }}
           show_full_output: ${{ inputs.debug == true }}
@@ -144,7 +165,7 @@ jobs:
         if: needs.gate.outputs.auth == 'api_key'
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ steps.creds.outputs.api_key }}
           claude_args: ${{ env.CLAUDE_ARGS }}
           prompt: ${{ steps.prompt.outputs.text }}
           show_full_output: ${{ inputs.debug == true }}

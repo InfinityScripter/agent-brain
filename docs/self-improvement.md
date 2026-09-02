@@ -74,11 +74,18 @@ one-time steps; without them it skips quietly.
      it is valid for one year and can only make model requests. The token
      is tied to the person who generated it, so it fits a personal
      repository; for a shared organization secret use an API key instead.
+     Copy the token as one line: a terminal wraps it at column 80, and a
+     pasted line break makes the run fail with "Invalid auth token". The
+     workflow strips whitespace from the secret, so a wrapped paste is
+     repaired automatically, but a truncated one is not.
    - `ANTHROPIC_API_KEY` — a Claude Console key, billed per token.
 
    The fastest path is `/install-github-app` inside a local `claude`
    session in this repository: it installs the app and stores the secret
    for you (skip its workflow-file step; this repository already has one).
+
+To see why a round failed, run the workflow manually with `debug` enabled:
+the job log then contains Claude's full output, which is hidden by default.
 
 Scheduled runs are attributed to the account that last edited the `cron`
 line, and the action refuses to run for bot accounts. If the first
