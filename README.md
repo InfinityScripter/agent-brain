@@ -81,7 +81,7 @@ finishes with a walk test plus the generated relations map.
 
 ## Run from source
 
-Requirements: macOS 12+, Python 3.9+, Node.js 20+. The DMG bundles Python and
+Requirements: macOS 13+, Python 3.9+, Node.js 20+. The DMG bundles Python and
 does not require a separate Python installation.
 
 One command from clone to a running app:
