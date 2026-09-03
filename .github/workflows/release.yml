@@ -1,17 +1,33 @@
 name: Release macOS
 
+# Builds the universal DMG and publishes it as a GitHub release.
+#
+# Two ways to cut a release, both from a commit whose package.json version
+# (and brain.py __version__, kept in sync by `npm run test:public`) is the
+# version being shipped:
+#   - push the tag `v<version>` at that commit, or
+#   - run this workflow manually on `main` (Actions tab or API); the run
+#     then creates the tag `v<version>` itself when it publishes the
+#     release. This covers release engineering from an environment that
+#     may merge pull requests but cannot push tags.
+
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 concurrency:
   group: release-${{ github.ref }}
 
 jobs:
   build:
+    # Manual releases are cut from main only; a tag push carries its own ref.
+    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
     runs-on: macos-26
     permissions:
       contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.name }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -23,9 +39,23 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - name: Verify tag matches package version
+      - name: Resolve the release tag from package.json
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          test "$GITHUB_REF_NAME" = "v$(node -p "require('./package.json').version")"
+          tag="v$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            if [ "$GITHUB_REF_NAME" != "$tag" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match the package.json version ($tag)"
+              exit 1
+            fi
+          elif gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::$tag is already released; bump the version in package.json and brain.py first"
+            exit 1
+          fi
+          echo "name=$tag" >> "$GITHUB_OUTPUT"
       - run: npm ci
       - run: npm run test:python
       - run: npm test
@@ -73,4 +103,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" "release/Agent Brain.dmg#Agent Brain.dmg" "release/SHA256SUMS#SHA256SUMS" --generate-notes --verify-tag
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          # Tag push: the tag exists, refuse to publish against a missing one.
+          # Manual run: GitHub creates the tag at the built commit on publish.
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            set -- --verify-tag
+          else
+            set -- --target "$GITHUB_SHA"
+          fi
+          gh release create "$TAG" "release/Agent Brain.dmg#Agent Brain.dmg" "release/SHA256SUMS#SHA256SUMS" --generate-notes "$@"
