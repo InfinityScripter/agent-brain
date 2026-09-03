@@ -29,7 +29,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # Must match "version" in package.json; scripts/public-release-check.cjs
 # fails the release gate when the two drift apart.
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 ENGINE_DIR = Path(__file__).resolve().parent
 DEFAULTS_DIR = ENGINE_DIR / "defaults"
