@@ -282,6 +282,97 @@ class AgentBrainCliTests(unittest.TestCase):
             self.assertEqual(self.run_brain(home, registry, "project", "delete", "sample", "--cascade").returncode, 0)
             self.assertEqual(self.run_brain(home, registry, "domain", "delete", "work.studio").returncode, 0)
 
+    def test_status_explain_use_and_domain_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            registry = home / ".agent-brain"
+            project = home / "Projects" / "shop"
+            skill = project / ".agents" / "skills" / "review"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("---\nname: review\ndescription: Review\n---\n", encoding="utf-8")
+            self.assertEqual(self.run_brain(home, registry, "init").returncode, 0)
+            self.assertEqual(
+                self.run_brain(home, registry, "project", "add", str(project), "--domain", "personal.software").returncode,
+                0,
+            )
+
+            status_json = self.run_brain(home, registry, "status", "--cwd", str(project), "--json")
+            self.assertEqual(status_json.returncode, 0, status_json.stderr)
+            status = json.loads(status_json.stdout)
+            self.assertEqual(status["context"]["domain"], "personal.software")
+            self.assertEqual(status["context"]["project"]["id"], "shop")
+            self.assertGreaterEqual(status["active_skill_count"], 1)
+
+            status_text = self.run_brain(home, registry, "status", "--cwd", str(project))
+            self.assertEqual(status_text.returncode, 0, status_text.stderr)
+            self.assertIn("Agent Brain context", status_text.stdout)
+            self.assertIn("domain:   personal.software", status_text.stdout)
+            self.assertIn("project:  shop", status_text.stdout)
+
+            unknown_status = self.run_brain(home, registry, "status", "--cwd", str(project), "--domain", "ghost")
+            self.assertEqual(unknown_status.returncode, 2)
+            self.assertIn("Unknown domain: ghost", unknown_status.stderr)
+
+            explain_json = self.run_brain(home, registry, "explain", "review", "--cwd", str(project), "--json")
+            self.assertEqual(explain_json.returncode, 0, explain_json.stderr)
+            explanation = json.loads(explain_json.stdout)
+            self.assertEqual(explanation["selected"]["id"], "project.shop.review")
+
+            explain_text = self.run_brain(home, registry, "explain", "review", "--cwd", str(project))
+            self.assertEqual(explain_text.returncode, 0, explain_text.stderr)
+            self.assertIn("Selected: project.shop.review", explain_text.stdout)
+            self.assertIn("Reason:", explain_text.stdout)
+            self.assertIn("Candidates:", explain_text.stdout)
+
+            explain_miss = self.run_brain(home, registry, "explain", "does-not-exist", "--cwd", str(project))
+            self.assertEqual(explain_miss.returncode, 2)
+            self.assertIn("No skill matches: does-not-exist", explain_miss.stdout)
+
+            created_domain = self.run_brain(
+                home, registry, "domain", "save", "research", "--name", "Research"
+            )
+            self.assertEqual(created_domain.returncode, 0, created_domain.stderr)
+            second = home / "Projects" / "second"
+            second.mkdir(parents=True)
+            self.assertEqual(
+                self.run_brain(home, registry, "project", "add", str(second), "--domain", "research").returncode, 0
+            )
+            workflow = self.run_brain(
+                home, registry, "workflow", "save", "study", "--name", "Study",
+                "--domain", "research", "--steps-json", "[]"
+            )
+            self.assertEqual(workflow.returncode, 0, workflow.stderr)
+
+            dependencies = self.run_brain(home, registry, "domain", "dependencies", "research")
+            self.assertEqual(dependencies.returncode, 0, dependencies.stderr)
+            payload = json.loads(dependencies.stdout)
+            self.assertEqual(payload["projects"], ["second"])
+            self.assertEqual(payload["workflows"], ["study"])
+
+            unknown_domain = self.run_brain(home, registry, "domain", "dependencies", "ghost")
+            self.assertEqual(unknown_domain.returncode, 2)
+
+            dry_run = self.run_brain(home, registry, "use", "research", "--cwd", str(project), "--dry-run")
+            self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
+            self.assertIn("Would hide", dry_run.stdout)
+            self.assertFalse((registry / "state" / "active-context.json").exists())
+
+            used = self.run_brain(home, registry, "use", "research", "--cwd", str(project))
+            self.assertEqual(used.returncode, 0, used.stderr)
+            self.assertIn("Default domain override set to research.", used.stdout)
+            self.assertIn("Hidden from the model", used.stdout)
+            state = json.loads((registry / "state" / "active-context.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["domain"], "research")
+
+            cleared = self.run_brain(home, registry, "use", "auto")
+            self.assertEqual(cleared.returncode, 0, cleared.stderr)
+            self.assertIn("Explicit domain override cleared", cleared.stdout)
+            self.assertFalse((registry / "state" / "active-context.json").exists())
+
+            unknown_use = self.run_brain(home, registry, "use", "ghost")
+            self.assertEqual(unknown_use.returncode, 2)
+            self.assertIn("Unknown domain: ghost", unknown_use.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
