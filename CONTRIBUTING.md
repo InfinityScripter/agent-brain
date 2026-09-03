@@ -55,6 +55,17 @@ download caches, absolute home paths, tokens, or internal package-registry
 URLs. Put reusable examples under `defaults/` with synthetic names and `~`
 paths only.
 
+## Releases
+
+1. Bump the version in one commit: `npm version <x.y.z> --no-git-tag-version`
+   and set `__version__` in `brain.py` to the same value (`npm run test:public`
+   fails when they drift). Land it on `main` through a pull request.
+2. Either push the tag `v<x.y.z>` at that commit, or run the **Release macOS**
+   workflow manually on `main` from the Actions tab; a manual run creates the
+   tag itself. The workflow builds the universal DMG on `macos-26`, runs the
+   packaged-app smoke tests, and publishes the GitHub release together with a
+   `SHA256SUMS` file.
+
 ## Pull requests
 
 Keep changes focused, explain user impact, and include the commands used for
