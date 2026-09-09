@@ -3,8 +3,12 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
+from typing import Optional
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,7 +16,9 @@ BRAIN = ROOT / "brain.py"
 
 
 class AgentBrainCliTests(unittest.TestCase):
-    def run_brain(self, home: Path, registry: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    def run_brain(
+        self, home: Path, registry: Path, *args: str, input: Optional[str] = None
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(BRAIN), "--registry", str(registry), *args],
             cwd=ROOT,
@@ -20,6 +26,7 @@ class AgentBrainCliTests(unittest.TestCase):
             check=False,
             capture_output=True,
             text=True,
+            input=input,
         )
 
     def test_version_flag_matches_package_json(self):
@@ -372,6 +379,72 @@ class AgentBrainCliTests(unittest.TestCase):
             unknown_use = self.run_brain(home, registry, "use", "ghost")
             self.assertEqual(unknown_use.returncode, 2)
             self.assertIn("Unknown domain: ghost", unknown_use.stderr)
+
+    def test_hook_emits_context_and_ignores_bad_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            registry = home / ".agent-brain"
+            project = home / "Projects" / "shop"
+            project.mkdir(parents=True)
+            self.assertEqual(self.run_brain(home, registry, "init").returncode, 0)
+            self.assertEqual(
+                self.run_brain(home, registry, "project", "add", str(project), "--domain", "personal.software").returncode,
+                0,
+            )
+
+            hooked = self.run_brain(
+                home, registry, "hook", "--runtime", "claude",
+                input=json.dumps({"cwd": str(project)}),
+            )
+            self.assertEqual(hooked.returncode, 0, hooked.stderr)
+            payload = json.loads(hooked.stdout)
+            output = payload["hookSpecificOutput"]
+            self.assertEqual(output["hookEventName"], "UserPromptSubmit")
+            additional = output["additionalContext"]
+            self.assertIn("Runtime: claude.", additional)
+            self.assertIn("Domain: `personal.software`.", additional)
+            self.assertIn("Project: `shop`.", additional)
+
+            no_cwd = self.run_brain(home, registry, "hook", "--runtime", "codex", input="{}")
+            self.assertEqual(no_cwd.returncode, 0, no_cwd.stderr)
+            self.assertIn("Runtime: codex.", json.loads(no_cwd.stdout)["hookSpecificOutput"]["additionalContext"])
+
+            malformed = self.run_brain(home, registry, "hook", "--runtime", "claude", input="not json")
+            self.assertEqual(malformed.returncode, 0, malformed.stderr)
+            self.assertEqual(malformed.stdout, "")
+
+    def test_serve_serves_the_dashboard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            registry = home / ".agent-brain"
+            self.assertEqual(self.run_brain(home, registry, "init").returncode, 0)
+
+            port = 18765
+            with subprocess.Popen(
+                [sys.executable, str(BRAIN), "--registry", str(registry), "serve", "--port", str(port)],
+                cwd=ROOT,
+                env={**os.environ, "HOME": str(home)},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ) as process:
+                try:
+                    body = None
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        try:
+                            with urllib.request.urlopen(f"http://127.0.0.1:{port}/index.html", timeout=1) as response:
+                                body = response.read().decode("utf-8")
+                            break
+                        except (urllib.error.URLError, ConnectionError):
+                            if process.poll() is not None:
+                                self.fail(f"serve exited early: {process.stderr.read()}")
+                            time.sleep(0.1)
+                    self.assertIsNotNone(body, "dashboard server never became ready")
+                    self.assertIn("<html", body.lower())
+                finally:
+                    process.terminate()
+                    process.wait(timeout=5)
 
 
 if __name__ == "__main__":
