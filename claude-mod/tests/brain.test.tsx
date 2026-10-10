@@ -761,3 +761,35 @@ test('the advice tab puts each recommendation in its own card with the skill as 
   expect(await ui.find({ type: 'Text', text: 'Нет скилла для тестов' })).toBeDefined()
   await ui.unmount()
 })
+
+test('no wrapping row spaces its children with gap or rowGap, on any tab or on the confirm screen', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on, {
+    inspect: { ...INSPECT, advice: { recommendations: [{ listed_name: 'lavish', status: 'recommended', reasons: ['нужны схемы'] }], gaps: [] } },
+  })
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const wrapped: Record<string, number> = {}
+  const offenders: [string, unknown, string][] = []
+  const inspect = async (screen: string) => {
+    const rows = (await ui.findAll({ type: 'Box' })).filter(box => box.props.flexWrap === 'wrap')
+    wrapped[screen] = rows.length
+    for (const row of rows) {
+      if (row.props.gap !== undefined || row.props.rowGap !== undefined) offenders.push([screen, row.props.gap ?? row.props.rowGap, row.text])
+    }
+  }
+  for (const tab of ['skills', 'dupes', 'calls', 'advice']) {
+    await ui.press({ key: `tab-${tab}` })
+    await inspect(tab)
+  }
+  await ui.press({ key: 'tab-skills' })
+  await ui.press({ key: 'apply' })
+  await inspect('confirm')
+  await ui.press({ key: 'cancel' })
+
+  expect(wrapped).toEqual({ skills: 4, dupes: 7, calls: 4, advice: 5, confirm: 2 })
+  expect(offenders).toEqual([])
+  await ui.unmount()
+})

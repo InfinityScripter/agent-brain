@@ -16,7 +16,7 @@ export function Chip({ Box, Text }: Ui, color: string, text: string) {
 }
 
 export function Card({ Box }: Ui, direction: 'row' | 'column', ...children: RenderChildren[]) {
-  const wrapped = direction === 'row' ? ({ flexWrap: 'wrap', gap: 1 } as const) : {}
+  const wrapped = direction === 'row' ? ({ flexWrap: 'wrap', columnGap: 1 } as const) : {}
   return (
     <Box flexDirection={direction} {...wrapped} borderStyle="round" borderColor={CARD_BORDER} paddingX={1}>
       {children}
@@ -28,7 +28,7 @@ export function AreaHeader(ui: Ui, view: BrainView) {
   const { Box, Text } = ui
   return (
     <Box flexDirection="column">
-      <Box flexDirection="row" flexWrap="wrap" gap={1}>
+      <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
         {Chip(ui, areaIdColor(view.domain), view.domain)}
         <Text dimColor>Цепочка:</Text>
         {view.chain.length === 0 && <Text dimColor>—</Text>}
@@ -81,7 +81,7 @@ export function HarnessCards(ui: Ui, harness: BrainView['harness']) {
   ]
   return (
     <Box flexDirection="column">
-      <Box flexDirection="row" flexWrap="wrap" gap={1}>
+      <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
         {cards.map(card =>
           Card(ui, 'column', <Text bold>{card.count}</Text>, <Text>{card.title}</Text>, card.note && <Text dimColor>{card.note}</Text>),
         )}

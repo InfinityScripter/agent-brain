@@ -244,7 +244,7 @@ export const register: Register = on => {
           <Text bold wrap="wrap">{action.title}</Text>
           <Text dimColor wrap="wrap">{commandLine(action.args)}</Text>
           <Text wrap="wrap">{action.explain}</Text>
-          <Box flexDirection="row" flexWrap="wrap" gap={1}>
+          <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
             <Button key="confirm" variant="primary" label="Выполнить" onPress={() => execute($, action)} />
             <Button key="cancel" autoFocus label="Отмена" onPress={() => update($, pending, () => null)} />
           </Box>
@@ -280,7 +280,7 @@ export const register: Register = on => {
         <Box flexDirection="column" marginTop={1}>
           {HarnessCards(ui, current.harness)}
         </Box>
-        <Box flexDirection="row" flexWrap="wrap" gap={1} marginTop={1}>
+        <Box flexDirection="row" flexWrap="wrap" columnGap={1} marginTop={1}>
           <Button key="tab-skills" label="Скиллы" variant={shownTab === 'skills' ? 'primary' : 'secondary'} onPress={setTab('skills')} />
           <Button key="tab-dupes" label="Дубли" variant={shownTab === 'dupes' ? 'primary' : 'secondary'} onPress={setTab('dupes')} />
           <Button key="tab-calls" label="Вызовы" variant={shownTab === 'calls' ? 'primary' : 'secondary'} onPress={setTab('calls')} />
