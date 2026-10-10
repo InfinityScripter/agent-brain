@@ -1,7 +1,7 @@
 import type { Elements } from 'claude-code'
 
 import type { BrainGroup, BrainView } from '../types'
-import { areaColor, areaKey, groupColor, percentShares } from './charts'
+import { areaColor, areaKey, groupColor, percentOfMax, percentShares } from './charts'
 
 export type Ui = Pick<Elements['desktop'], 'Box' | 'Text' | 'Button'>
 
@@ -130,6 +130,25 @@ export function SkillGroups(
           </Box>
         )
       })}
+    </Box>
+  )
+}
+
+export function CallsChart({ Box, Text }: Ui, title: string, rows: { name: string; calls: number }[], empty: string) {
+  const shown = rows.slice(0, 8)
+  const max = Math.max(0, ...shown.map(row => row.calls))
+  return (
+    <Box flexDirection="column">
+      <Text bold>{title}</Text>
+      {shown.length === 0 && <Text dimColor>{empty}</Text>}
+      {shown.map(row => (
+        <Box flexDirection="column">
+          <Text>{row.name}: {row.calls}</Text>
+          <Box flexDirection="row" width="100%">
+            <Box width={`${percentOfMax(row.calls, max)}%`} minWidth={1} height={1} backgroundColor={areaColor('meta')} />
+          </Box>
+        </Box>
+      ))}
     </Box>
   )
 }

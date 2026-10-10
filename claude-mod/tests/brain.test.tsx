@@ -568,3 +568,147 @@ test('an opened group stays open after a refresh and after a finished action, an
   expect(await buttonKeys(ui, 'off-')).toEqual(['off-tef-trigger-platform-0', 'off-tef-trigger-platform-1'])
   await ui.unmount()
 })
+
+const inspectWithUsage = (counts: Record<string, number>) => ({
+  ...INSPECT,
+  skills: Object.entries(counts).map(([name, count]) => ({
+    listed_name: name,
+    scope_detail: null,
+    usage: { count },
+    hideable: true,
+    override: { effective: null, level: null },
+  })),
+})
+
+type Found = { text: string; props: Record<string, unknown> }
+
+const callsOnScreen = async (ui: { findAll: (query: { type: string }) => Promise<Found[]> }) => ({
+  rows: (await ui.findAll({ type: 'Text' })).map(item => item.text).filter(text => /^[\w:-]+: \d+$/.test(text)),
+  bars: (await ui.findAll({ type: 'Box' }))
+    .filter(box => box.props.backgroundColor === '#9c83ff' && typeof box.props.width === 'string')
+    .map(box => box.props.width),
+})
+
+test('each calls row gets a bar as long as its count against the top count of its block, never under one percent', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on, { inspect: inspectWithUsage({ busy: 300, half: 150, rare: 1, silent: 0 }) })
+  on('tool.call', { tool: 'Skill' }, (_$, e) => ({ result: { success: true, commandName: e.skill } }) as never)
+  for (const skill of ['lavish', 'lavish', 'lavish', 'lavish', 'humanizer', 'humanizer', 'task-observer']) {
+    await $.tool.call({ tool: 'Skill', skill } as never)
+  }
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await callsOnScreen(ui)).bars).toEqual([])
+  await ui.press({ key: 'tab-calls' })
+  expect(await callsOnScreen(ui)).toEqual({
+    rows: ['lavish: 4', 'humanizer: 2', 'task-observer: 1', 'busy: 300', 'half: 150', 'rare: 1'],
+    bars: ['100%', '50%', '25%', '100%', '50%', '1%'],
+  })
+  expect(await ui.find({ type: 'Text', text: 'В этой сессии' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'За всё время, во всех папках' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('with no calls both blocks say so and draw no bars', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on, { inspect: inspectWithUsage({ silent: 0 }) })
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'tab-calls' })
+  expect(await ui.find({ type: 'Text', text: 'Скиллы ещё не вызывались.' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Вызовов пока нет.' })).toBeDefined()
+  expect(await callsOnScreen(ui)).toEqual({ rows: [], bars: [] })
+  await ui.unmount()
+})
+
+test('each calls block shows at most eight rows', async ($, on) => {
+  const clock = mock.clock(on)
+  const names = Array.from({ length: 10 }, (_, index) => `skill-${index}`)
+  brainWorld(on, { inspect: inspectWithUsage(Object.fromEntries(names.map((name, index) => [name, 10 - index]))) })
+  on('tool.call', { tool: 'Skill' }, (_$, e) => ({ result: { success: true, commandName: e.skill } }) as never)
+  for (const skill of names) await $.tool.call({ tool: 'Skill', skill } as never)
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-calls' })
+  const { rows, bars } = await callsOnScreen(ui)
+  expect(rows.length).toBe(16)
+  expect(bars.length).toBe(16)
+  expect(rows.slice(8)).toEqual(names.slice(0, 8).map((name, index) => `${name}: ${10 - index}`))
+  await ui.unmount()
+})
+
+test('the duplicates tab puts each preference in its own card with the skill names as badges', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on)
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-dupes' })
+  const names = ['test-driven-development', 'superpowers:tdd', 'systematic-debugging', 'superpowers:systematic-debugging', 'skill-conductor', 'superpowers:writing-skills']
+  const boxes = await ui.findAll({ type: 'Box' })
+  expect(boxes.filter(box => names.includes(box.text) && box.props.backgroundColor).map(box => [box.text, box.props.backgroundColor])).toEqual([
+    ['test-driven-development', '#45c79a'],
+    ['superpowers:tdd', '#f2eddf'],
+    ['systematic-debugging', '#45c79a'],
+    ['superpowers:systematic-debugging', '#f2eddf'],
+    ['skill-conductor', '#45c79a'],
+    ['superpowers:writing-skills', '#f2eddf'],
+  ])
+  const cards = boxes.filter(box => box.props.borderStyle === 'round' && box.props.flexDirection === 'row')
+  expect(cards.length).toBe(3)
+  expect(cards.map(card => /Тесты до кода|Баг|Скилл/.exec(card.text)?.[0])).toEqual(['Тесты до кода', 'Баг', 'Скилл'])
+  expect((await ui.find({ type: 'Text', text: 'Тесты до кода:' }))?.props.bold).toBe(true)
+  expect((await ui.findAll({ type: 'Text', text: 'беру' })).length).toBe(3)
+  expect((await ui.findAll({ type: 'Text', text: 'вместо' })).length).toBe(3)
+  const notHere = await ui.findAll({ type: 'Text', text: '· в этой области не действует' })
+  expect(notHere.length).toBe(1)
+  expect(cards[1]?.text).toMatch(/в этой области не действует/)
+  await ui.unmount()
+})
+
+test('the advice tab puts each recommendation in its own card with the skill as a badge, and says so when there are none', async ($, on) => {
+  const clock = mock.clock(on)
+  const world: World = {}
+  brainWorld(on, world)
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-advice' })
+  expect(await ui.find({ type: 'Text', text: 'Советов нет.' })).toBeDefined()
+
+  world.inspect = {
+    ...INSPECT,
+    advice: {
+      recommendations: [
+        { listed_name: 'humanizer', status: 'recommended', reasons: ['пишешь тексты от имени Миши', 'ещё причина'] },
+        { listed_name: 'arc', status: 'already-active', reasons: ['уже включён'] },
+        { listed_name: 'lavish', status: 'recommended', reasons: ['нужны схемы'] },
+      ],
+      gaps: ['Нет скилла для тестов'],
+    },
+  }
+  await ui.press({ key: 'reload' })
+  await clock.settle()
+
+  expect(await ui.find({ type: 'Text', text: 'Советов нет.' })).toBeUndefined()
+  const boxes = await ui.findAll({ type: 'Box' })
+  expect(boxes.filter(box => ['humanizer', 'arc', 'lavish'].includes(box.text) && box.props.backgroundColor).map(box => [box.text, box.props.backgroundColor])).toEqual([
+    ['humanizer', '#45c79a'],
+    ['lavish', '#45c79a'],
+  ])
+  const cards = boxes.filter(box => box.props.borderStyle === 'round' && box.props.flexDirection === 'row')
+  expect(cards.length).toBe(2)
+  expect(cards[0]?.text).toMatch(/пишешь тексты от имени Миши/)
+  expect(cards[1]?.text).toMatch(/нужны схемы/)
+  expect((await ui.findAll({ type: 'Text', text: 'Стоит включить' })).length).toBe(2)
+  expect(await ui.find({ type: 'Text', text: 'Нет скилла для тестов' })).toBeDefined()
+  await ui.unmount()
+})

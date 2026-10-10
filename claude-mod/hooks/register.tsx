@@ -2,8 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { Hook, Register } from 'claude-code'
 
 import type { BrainAction, BrainTab, BrainView } from '../types'
-import { formatTokens } from './charts'
-import { AreaHeader, HarnessCards, ShareBar, SkillGroups } from './panel'
+import { areaColor, formatTokens } from './charts'
+import { AreaHeader, CallsChart, Chip, HarnessCards, ShareBar, SkillGroups } from './panel'
 import {
   applyProfileAction,
   buildView,
@@ -310,23 +310,29 @@ export const register: Register = on => {
           <Box flexDirection="column">
             {current.dupes.length === 0 && <Text dimColor>Предпочтений нет: добавь skill_preferences в config/brain.json.</Text>}
             {current.dupes.map(row => (
-              <Text wrap="wrap">
-                <Text bold>{row.task}</Text>: беру {row.use} вместо {row.insteadOf.join(', ')}
-                <Text dimColor>{row.applies ? '' : ' · в этой области не действует'}</Text>
-              </Text>
+              <Box flexDirection="row" flexWrap="wrap" gap={1} borderStyle="round" borderColor={areaColor('other')} paddingX={1}>
+                <Text bold>{row.task}:</Text>
+                <Text>беру</Text>
+                {Chip(ui, areaColor('project'), row.use)}
+                <Text>вместо</Text>
+                {row.insteadOf.map(name => Chip(ui, areaColor('global'), name))}
+                {!row.applies && <Text dimColor>· в этой области не действует</Text>}
+              </Box>
             ))}
           </Box>
         )}
 
         {shownTab === 'calls' && (
           <Box flexDirection="column">
-            <Text bold>В этой сессии</Text>
-            {Object.keys(sessionCalls).length === 0 && <Text dimColor>Скиллы ещё не вызывались.</Text>}
-            {Object.entries(sessionCalls)
-              .sort((a, b) => b[1] - a[1])
-              .map(([name, count]) => <Text>{name}: {count}</Text>)}
-            <Text bold>За всё время, во всех папках</Text>
-            {current.topCalls.map(item => <Text>{item.name}: {item.calls}</Text>)}
+            {CallsChart(
+              ui,
+              'В этой сессии',
+              Object.entries(sessionCalls)
+                .sort((a, b) => b[1] - a[1])
+                .map(([name, count]) => ({ name, calls: count })),
+              'Скиллы ещё не вызывались.',
+            )}
+            {CallsChart(ui, 'За всё время, во всех папках', current.topCalls, 'Вызовов пока нет.')}
           </Box>
         )}
 
@@ -334,7 +340,11 @@ export const register: Register = on => {
           <Box flexDirection="column">
             {current.recommended.length === 0 && current.gaps.length === 0 && <Text dimColor>Советов нет.</Text>}
             {current.recommended.map(item => (
-              <Text wrap="wrap">Стоит включить {item.name}: <Text dimColor>{item.reason}</Text></Text>
+              <Box flexDirection="row" flexWrap="wrap" gap={1} borderStyle="round" borderColor={areaColor('other')} paddingX={1}>
+                <Text>Стоит включить</Text>
+                {Chip(ui, areaColor('project'), item.name)}
+                <Text dimColor wrap="wrap">{item.reason}</Text>
+              </Box>
             ))}
             {current.gaps.map(text => <Text wrap="wrap">{text}</Text>)}
           </Box>
