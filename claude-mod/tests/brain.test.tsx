@@ -306,6 +306,35 @@ test('the header shows the area and its chain as badges in the area colors, on e
   }
 })
 
+test('the header keeps the area badge and the chain in one wrapping row, the reason on one dim line, and nothing blank above the bar label', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on, { inspect: META_INSPECT })
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  type Drawn = { type: string; props: Record<string, unknown>; children?: (Drawn | string)[] }
+  const inOrder = (node: Drawn | string): Drawn[] => (typeof node === 'string' ? [] : [node, ...(node.children ?? []).flatMap(inOrder)])
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const rows = (await ui.findAll({ type: 'Box' })).filter(box => box.props.flexDirection === 'row' && box.props.flexWrap === 'wrap' && box.text.includes('Цепочка:'))
+    expect(rows.map(row => row.text)).toEqual(['meta.agent-systemЦепочка:metameta.agent-systemproject:agent-brain'])
+    expect(rows[0]?.children).toHaveLength(5)
+
+    const reasons = await ui.findAll({ type: 'Text', text: /^Почему/ })
+    expect(reasons.map(reason => [reason.text, reason.props.dimColor, reason.props.wrap])).toEqual([
+      ['Почему: папка зарегистрированного проекта: agent-brain.', true, 'truncate-end'],
+    ])
+
+    const tree = inOrder((await ui.drawn()) as Drawn)
+    const aboveLabel = tree.slice(0, tree.findIndex(node => node.type === 'Text' && node.children?.join('') === 'Модель видит 5'))
+    expect(aboveLabel.length).toBeGreaterThan(5)
+    expect(aboveLabel.filter(node => node.type === 'Text' && !node.children?.join('').trim())).toEqual([])
+    expect(aboveLabel.filter(node => Object.keys(node.props).some(name => /^(margin|padding)(Top|Bottom|Y)?$/.test(name))).map(node => node.props)).toEqual([])
+    await ui.unmount()
+  }
+})
+
 test('the bar splits what the model sees into whole percents that add up to 100, with a legend', async ($, on) => {
   const clock = mock.clock(on)
   brainWorld(on)

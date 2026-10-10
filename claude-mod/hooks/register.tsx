@@ -269,7 +269,7 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         {header}
-        <Box flexDirection="column" marginTop={1}>
+        <Box flexDirection="column">
           {ShareBar(ui, current)}
           <Text wrap="wrap">{profileLine}</Text>
           {canApply && (

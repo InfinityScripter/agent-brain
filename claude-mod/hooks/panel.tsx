@@ -28,13 +28,13 @@ export function AreaHeader(ui: Ui, view: BrainView) {
   const { Box, Text } = ui
   return (
     <Box flexDirection="column">
-      {Chip(ui, areaIdColor(view.domain), view.domain)}
-      <Text dimColor wrap="wrap">Почему: {view.domainReason}.</Text>
       <Box flexDirection="row" flexWrap="wrap" gap={1}>
+        {Chip(ui, areaIdColor(view.domain), view.domain)}
         <Text dimColor>Цепочка:</Text>
         {view.chain.length === 0 && <Text dimColor>—</Text>}
         {view.chain.map(id => Chip(ui, areaIdColor(id), id))}
       </Box>
+      <Text dimColor wrap="truncate-end">Почему: {view.domainReason}.</Text>
     </Box>
   )
 }
