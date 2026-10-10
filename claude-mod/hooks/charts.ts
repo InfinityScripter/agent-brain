@@ -11,6 +11,12 @@ const COLORS: Record<AreaKey, string> = {
   other: '#687080',
 }
 
+export const INK = '#111318'
+export const DANGER = '#ff6b5f'
+export const MUTED = '#8c93a4'
+export const CALLS = '#cfc8b8'
+export const CARD_BORDER = '#687080'
+
 export function areaKey(id: string | null): AreaKey {
   const head = (id ?? '').split(/[.:]/)[0] ?? ''
   return Object.hasOwn(COLORS, head) ? (head as AreaKey) : 'other'
@@ -20,8 +26,12 @@ export function areaColor(key: AreaKey): string {
   return COLORS[key]
 }
 
+export function areaIdColor(id: string | null): string {
+  return areaColor(areaKey(id))
+}
+
 export function groupColor(level: string | null, label: string): string {
-  if (level === 'domain') return areaColor(areaKey(label))
+  if (level === 'domain') return areaIdColor(label)
   if (level === 'project') return areaColor('project')
   if (level === 'plugin') return areaColor('plugin')
   return areaColor('global')

@@ -2,8 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { Hook, Register } from 'claude-code'
 
 import type { BrainAction, BrainTab, BrainView } from '../types'
-import { areaColor, formatTokens } from './charts'
-import { AreaHeader, CallsChart, Chip, HarnessCards, ShareBar, SkillGroups } from './panel'
+import { formatTokens } from './charts'
+import { AdviceCard, AreaHeader, CallsChart, DupeCard, HarnessCards, ShareBar, SkillGroups } from './panel'
 import {
   applyProfileAction,
   buildView,
@@ -309,16 +309,7 @@ export const register: Register = on => {
         {shownTab === 'dupes' && (
           <Box flexDirection="column">
             {current.dupes.length === 0 && <Text dimColor>Предпочтений нет: добавь skill_preferences в config/brain.json.</Text>}
-            {current.dupes.map(row => (
-              <Box flexDirection="row" flexWrap="wrap" gap={1} borderStyle="round" borderColor={areaColor('other')} paddingX={1}>
-                <Text bold>{row.task}:</Text>
-                <Text>беру</Text>
-                {Chip(ui, areaColor('project'), row.use)}
-                <Text>вместо</Text>
-                {row.insteadOf.map(name => Chip(ui, areaColor('global'), name))}
-                {!row.applies && <Text dimColor>· в этой области не действует</Text>}
-              </Box>
-            ))}
+            {current.dupes.map(row => DupeCard(ui, row))}
           </Box>
         )}
 
@@ -339,13 +330,7 @@ export const register: Register = on => {
         {shownTab === 'advice' && (
           <Box flexDirection="column">
             {current.recommended.length === 0 && current.gaps.length === 0 && <Text dimColor>Советов нет.</Text>}
-            {current.recommended.map(item => (
-              <Box flexDirection="row" flexWrap="wrap" gap={1} borderStyle="round" borderColor={areaColor('other')} paddingX={1}>
-                <Text>Стоит включить</Text>
-                {Chip(ui, areaColor('project'), item.name)}
-                <Text dimColor wrap="wrap">{item.reason}</Text>
-              </Box>
-            ))}
+            {current.recommended.map(item => AdviceCard(ui, item))}
             {current.gaps.map(text => <Text wrap="wrap">{text}</Text>)}
           </Box>
         )}

@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { areaColor, areaKey, formatTokens, groupColor, percentOfMax, percentShares } from '../hooks/charts'
+import { CALLS, DANGER, MUTED, areaColor, areaIdColor, areaKey, formatTokens, groupColor, percentOfMax, percentShares } from '../hooks/charts'
 
 test('the area key is the part of the id before the first dot or colon', () => {
   expect(areaKey('meta.agent-system')).toBe('meta')
@@ -28,6 +28,18 @@ test('area and group colors follow the Agent Brain palette', () => {
   expect(groupColor('plugin', 'claude-mem')).toBe('#69d3c5')
   expect(groupColor('global', 'без области')).toBe('#f2eddf')
   expect(groupColor(null, 'без области')).toBe('#f2eddf')
+})
+
+test('the color by area id follows the first part of the id', () => {
+  expect(areaIdColor('meta.agent-system')).toBe('#9c83ff')
+  expect(areaIdColor('project:agent-brain')).toBe('#45c79a')
+  expect(areaIdColor('travel.rome')).toBe('#687080')
+  expect(areaIdColor(null)).toBe('#687080')
+})
+
+test('the calls bars have a color that no area and no share bar segment uses', () => {
+  const taken = (['work', 'personal', 'creative', 'meta', 'project', 'plugin', 'global', 'other'] as const).map(areaColor)
+  expect([...taken, DANGER, MUTED]).not.toContain(CALLS)
 })
 
 test('percent shares are whole numbers that add up to 100', () => {

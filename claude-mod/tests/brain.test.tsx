@@ -313,8 +313,7 @@ test('the bar splits what the model sees into whole percents that add up to 100,
   await clock.settle()
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  const segments = (await ui.findAll({ type: 'Box' })).filter(box => box.props.backgroundColor && typeof box.props.width === 'string')
-  expect(segments.map(box => [box.props.width, box.props.backgroundColor, box.props.minWidth])).toEqual([
+  expect((await segmentsOf(ui)).map(segment => [segment.props.width, segment.props.backgroundColor, segment.props.minWidth])).toEqual([
     ['50%', '#f3b64b', 1],
     ['17%', '#ff6b5f', 1],
     ['17%', '#69d3c5', 1],
@@ -333,8 +332,7 @@ test('without the list of skills the model sees, the bar has no in-area part and
   await clock.settle()
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  const segments = (await ui.findAll({ type: 'Box' })).filter(box => box.props.backgroundColor && typeof box.props.width === 'string')
-  expect(segments.map(box => [box.props.width, box.props.backgroundColor])).toEqual([
+  expect((await segmentsOf(ui)).map(segment => [segment.props.width, segment.props.backgroundColor])).toEqual([
     ['50%', '#ff6b5f'],
     ['25%', '#69d3c5'],
     ['25%', '#8c93a4'],
@@ -352,14 +350,29 @@ test('with nothing outside the area the bar keeps in-area and hidden, and the le
   await clock.settle()
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  const segments = (await ui.findAll({ type: 'Box' })).filter(box => box.props.backgroundColor && typeof box.props.width === 'string')
-  expect(segments.map(box => [box.props.width, box.props.backgroundColor])).toEqual([
+  expect((await segmentsOf(ui)).map(segment => [segment.props.width, segment.props.backgroundColor])).toEqual([
     ['83%', '#f3b64b'],
     ['17%', '#8c93a4'],
   ])
   expect(await ui.find({ type: 'Text', text: '5 в области' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '1 уже спрятаны вне области' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^0 / })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('more skills outside the area than the model sees leave no in-area part, and the shares stay at 100', async ($, on) => {
+  const clock = mock.clock(on)
+  const hide = ['ququ-review', 'superpowers:systematic-debugging', 'superpowers:writing-skills', 'test-driven-development', 'systematic-debugging']
+  brainWorld(on, { dry: { hide, tokens: 90, unhideable_plugin_skills: ['superpowers:tdd'] } })
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: 'Модель видит 5' })).toBeDefined()
+  expect((await segmentsOf(ui)).map(segment => [segment.props.width, segment.props.backgroundColor])).toEqual([
+    ['83%', '#ff6b5f'],
+    ['17%', '#69d3c5'],
+  ])
   await ui.unmount()
 })
 
@@ -405,13 +418,15 @@ test('four cards count rules, MCP servers, agents and instruction files, with th
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    const cards = (await ui.findAll({ type: 'Box' })).filter(box => box.props.borderStyle === 'round')
+    const cards = await cardsOf(ui)
     expect(cards.length).toBe(4)
     for (const title of ['Правила', 'MCP-серверы', 'Агенты', 'Файлы инструкций']) {
       expect(await ui.find({ type: 'Text', text: title })).toBeDefined()
     }
     expect(cards[0]?.text).toMatch(/выключено 1/)
-    const row = (await ui.findAll({ type: 'Box' })).find(box => box.props.flexWrap === 'wrap' && box.children.length === 4)
+    const row = (await ui.findAll({ type: 'Box' })).find(
+      box => box.props.flexWrap === 'wrap' && box.children.length === 4 && box.children.every(child => (child as Described).props.borderStyle === 'round'),
+    )
     expect(row).toBeDefined()
     expect(
       await ui.find({ type: 'Text', text: 'Здесь: правил 2, выключено 1; MCP-серверов 1; агентов 0; файлов инструкций 1.' }),
@@ -429,8 +444,8 @@ test('with no earlier data an error shows alone; with earlier data the numbers s
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const drawn = async () => ({
-    segments: (await ui.findAll({ type: 'Box' })).filter(box => box.props.backgroundColor && typeof box.props.width === 'string').length,
-    cards: (await ui.findAll({ type: 'Box' })).filter(box => box.props.borderStyle === 'round').length,
+    segments: (await segmentsOf(ui)).length,
+    cards: (await cardsOf(ui)).length,
   })
   expect(await ui.find({ text: /Brain не ответил: ValueError: boom/ })).toBeDefined()
   expect(await drawn()).toEqual({ segments: 0, cards: 0 })
@@ -580,13 +595,18 @@ const inspectWithUsage = (counts: Record<string, number>) => ({
   })),
 })
 
-type Found = { text: string; props: Record<string, unknown> }
+type Described = { props: Record<string, unknown> }
+type Found = Described & { text: string; children: unknown[] }
+type Screen = { findAll: (query: { type: string }) => Promise<Found[]> }
 
-const callsOnScreen = async (ui: { findAll: (query: { type: string }) => Promise<Found[]> }) => ({
+const segmentsOf = async (ui: Screen) =>
+  (await ui.findAll({ type: 'Box' })).filter(box => box.props.width === '100%').flatMap(track => track.children as Described[])
+
+const cardsOf = async (ui: Screen) => (await ui.findAll({ type: 'Box' })).filter(box => box.props.borderStyle === 'round')
+
+const callsOnScreen = async (ui: Screen) => ({
   rows: (await ui.findAll({ type: 'Text' })).map(item => item.text).filter(text => /^[\w:-]+: \d+$/.test(text)),
-  bars: (await ui.findAll({ type: 'Box' }))
-    .filter(box => box.props.backgroundColor === '#9c83ff' && typeof box.props.width === 'string')
-    .map(box => box.props.width),
+  bars: (await segmentsOf(ui)).filter(bar => bar.props.backgroundColor === '#cfc8b8').map(bar => bar.props.width),
 })
 
 test('each calls row gets a bar as long as its count against the top count of its block, never under one percent', async ($, on) => {
@@ -661,7 +681,7 @@ test('the duplicates tab puts each preference in its own card with the skill nam
     ['skill-conductor', '#45c79a'],
     ['superpowers:writing-skills', '#f2eddf'],
   ])
-  const cards = boxes.filter(box => box.props.borderStyle === 'round' && box.props.flexDirection === 'row')
+  const cards = (await cardsOf(ui)).filter(card => card.props.flexDirection === 'row')
   expect(cards.length).toBe(3)
   expect(cards.map(card => /Тесты до кода|Баг|Скилл/.exec(card.text)?.[0])).toEqual(['Тесты до кода', 'Баг', 'Скилл'])
   expect((await ui.find({ type: 'Text', text: 'Тесты до кода:' }))?.props.bold).toBe(true)
@@ -704,7 +724,7 @@ test('the advice tab puts each recommendation in its own card with the skill as 
     ['humanizer', '#45c79a'],
     ['lavish', '#45c79a'],
   ])
-  const cards = boxes.filter(box => box.props.borderStyle === 'round' && box.props.flexDirection === 'row')
+  const cards = (await cardsOf(ui)).filter(card => card.props.flexDirection === 'row')
   expect(cards.length).toBe(2)
   expect(cards[0]?.text).toMatch(/пишешь тексты от имени Миши/)
   expect(cards[1]?.text).toMatch(/нужны схемы/)

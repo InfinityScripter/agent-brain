@@ -1,13 +1,10 @@
-import type { Elements } from 'claude-code'
+import type { Elements, RenderChildren } from 'claude-code'
 
-import type { BrainGroup, BrainView } from '../types'
-import { areaColor, areaKey, groupColor, percentOfMax, percentShares } from './charts'
+import type { BrainDupe, BrainGroup, BrainView } from '../types'
+import { CALLS, CARD_BORDER, DANGER, INK, MUTED, areaColor, areaIdColor, groupColor, percentOfMax, percentShares } from './charts'
 
 export type Ui = Pick<Elements['desktop'], 'Box' | 'Text' | 'Button'>
 
-const INK = '#111318'
-const DANGER = '#ff6b5f'
-const MUTED = '#8c93a4'
 const ROWS_SHOWN = 25
 
 export function Chip({ Box, Text }: Ui, color: string, text: string) {
@@ -18,16 +15,25 @@ export function Chip({ Box, Text }: Ui, color: string, text: string) {
   )
 }
 
+export function Card({ Box }: Ui, direction: 'row' | 'column', ...children: RenderChildren[]) {
+  const wrapped = direction === 'row' ? ({ flexWrap: 'wrap', gap: 1 } as const) : {}
+  return (
+    <Box flexDirection={direction} {...wrapped} borderStyle="round" borderColor={CARD_BORDER} paddingX={1}>
+      {children}
+    </Box>
+  )
+}
+
 export function AreaHeader(ui: Ui, view: BrainView) {
   const { Box, Text } = ui
   return (
     <Box flexDirection="column">
-      {Chip(ui, areaColor(areaKey(view.domain)), view.domain)}
+      {Chip(ui, areaIdColor(view.domain), view.domain)}
       <Text dimColor wrap="wrap">Почему: {view.domainReason}.</Text>
       <Box flexDirection="row" flexWrap="wrap" gap={1}>
         <Text dimColor>Цепочка:</Text>
         {view.chain.length === 0 && <Text dimColor>—</Text>}
-        {view.chain.map(id => Chip(ui, areaColor(areaKey(id)), id))}
+        {view.chain.map(id => Chip(ui, areaIdColor(id), id))}
       </Box>
     </Box>
   )
@@ -37,7 +43,7 @@ export function ShareBar({ Box, Text }: Ui, view: BrainView) {
   const outside = view.visibleOutside.length
   const plugin = view.unhideable.length
   const parts = [
-    { count: view.listedCount === null ? 0 : Math.max(0, view.listedCount - outside - plugin), color: areaColor(areaKey(view.domain)), label: 'в области' },
+    { count: view.listedCount === null ? 0 : Math.max(0, view.listedCount - outside - plugin), color: areaIdColor(view.domain), label: 'в области' },
     { count: outside, color: DANGER, label: 'вне области' },
     { count: plugin, color: areaColor('plugin'), label: 'плагинные' },
     { count: view.hiddenAlready, color: MUTED, label: 'уже спрятаны вне области' },
@@ -65,7 +71,8 @@ export function ShareBar({ Box, Text }: Ui, view: BrainView) {
   )
 }
 
-export function HarnessCards({ Box, Text }: Ui, harness: BrainView['harness']) {
+export function HarnessCards(ui: Ui, harness: BrainView['harness']) {
+  const { Box, Text } = ui
   const cards = [
     { title: 'Правила', count: harness.rules, note: `выключено ${harness.rulesOff}` },
     { title: 'MCP-серверы', count: harness.mcp, note: null },
@@ -75,13 +82,9 @@ export function HarnessCards({ Box, Text }: Ui, harness: BrainView['harness']) {
   return (
     <Box flexDirection="column">
       <Box flexDirection="row" flexWrap="wrap" gap={1}>
-        {cards.map(card => (
-          <Box flexDirection="column" borderStyle="round" borderColor={areaColor('other')} paddingX={1}>
-            <Text bold>{card.count}</Text>
-            <Text>{card.title}</Text>
-            {card.note && <Text dimColor>{card.note}</Text>}
-          </Box>
-        ))}
+        {cards.map(card =>
+          Card(ui, 'column', <Text bold>{card.count}</Text>, <Text>{card.title}</Text>, card.note && <Text dimColor>{card.note}</Text>),
+        )}
       </Box>
       <Text dimColor wrap="wrap">
         Здесь: правил {harness.rules}, выключено {harness.rulesOff}; MCP-серверов {harness.mcp}; агентов {harness.agents}; файлов инструкций {harness.instructions}.
@@ -145,10 +148,35 @@ export function CallsChart({ Box, Text }: Ui, title: string, rows: { name: strin
         <Box flexDirection="column">
           <Text>{row.name}: {row.calls}</Text>
           <Box flexDirection="row" width="100%">
-            <Box width={`${percentOfMax(row.calls, max)}%`} minWidth={1} height={1} backgroundColor={areaColor('meta')} />
+            <Box width={`${percentOfMax(row.calls, max)}%`} minWidth={1} height={1} backgroundColor={CALLS} />
           </Box>
         </Box>
       ))}
     </Box>
+  )
+}
+
+export function DupeCard(ui: Ui, row: BrainDupe) {
+  const { Text } = ui
+  return Card(
+    ui,
+    'row',
+    <Text bold>{row.task}:</Text>,
+    <Text>беру</Text>,
+    Chip(ui, areaColor('project'), row.use),
+    <Text>вместо</Text>,
+    row.insteadOf.map(name => Chip(ui, areaColor('global'), name)),
+    !row.applies && <Text dimColor>· в этой области не действует</Text>,
+  )
+}
+
+export function AdviceCard(ui: Ui, item: BrainView['recommended'][number]) {
+  const { Text } = ui
+  return Card(
+    ui,
+    'row',
+    <Text>Стоит включить</Text>,
+    Chip(ui, areaColor('project'), item.name),
+    <Text dimColor wrap="wrap">{item.reason}</Text>,
   )
 }
