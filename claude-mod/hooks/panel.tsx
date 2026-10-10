@@ -1,13 +1,14 @@
 import type { Elements } from 'claude-code'
 
-import type { BrainView } from '../types'
-import { areaColor, areaKey, percentShares } from './charts'
+import type { BrainGroup, BrainView } from '../types'
+import { areaColor, areaKey, groupColor, percentShares } from './charts'
 
 export type Ui = Pick<Elements['desktop'], 'Box' | 'Text' | 'Button'>
 
 const INK = '#111318'
 const DANGER = '#ff6b5f'
 const MUTED = '#8c93a4'
+const ROWS_SHOWN = 25
 
 export function Chip({ Box, Text }: Ui, color: string, text: string) {
   return (
@@ -85,6 +86,50 @@ export function HarnessCards({ Box, Text }: Ui, harness: BrainView['harness']) {
       <Text dimColor wrap="wrap">
         Здесь: правил {harness.rules}, выключено {harness.rulesOff}; MCP-серверов {harness.mcp}; агентов {harness.agents}; файлов инструкций {harness.instructions}.
       </Text>
+    </Box>
+  )
+}
+
+export function SkillGroups(
+  { Box, Text, Button }: Ui,
+  groups: BrainGroup[],
+  open: string[],
+  onToggle: (label: string) => void,
+  onTurnOff: (name: string) => void,
+) {
+  const allOpen = groups.reduce((sum, group) => sum + group.skills.length, 0) <= 5
+  return (
+    <Box flexDirection="column">
+      {groups.map(group => {
+        const isOpen = allOpen || open.includes(group.label)
+        const hidden = group.skills.length - ROWS_SHOWN
+        return (
+          <Box flexDirection="column">
+            <Box flexDirection="row" gap={1}>
+              <Box key={`color-${group.label}`} width={2} height={1} backgroundColor={groupColor(group.level, group.label)} />
+              <Button
+                key={`group-${group.label}`}
+                variant={isOpen ? 'primary' : 'secondary'}
+                label={`${group.label} · скиллов: ${group.skills.length}`}
+                onPress={() => onToggle(group.label)}
+              />
+            </Box>
+            {isOpen && (
+              <Box flexDirection="column" paddingLeft={2}>
+                {group.skills.slice(0, ROWS_SHOWN).map(row => (
+                  <Box flexDirection="row" key={`row-${row.name}`}>
+                    <Text wrap="truncate-end">
+                      {row.name} <Text dimColor>· {row.detail ?? 'без области'} · вызовов {row.calls}</Text>
+                    </Text>
+                    <Button key={`off-${row.name}`} plain label="Выключить здесь" onPress={() => onTurnOff(row.name)} />
+                  </Box>
+                ))}
+                {hidden > 0 && <Text dimColor>И ещё {hidden} в этой группе: их спрячет профиль одной кнопкой.</Text>}
+              </Box>
+            )}
+          </Box>
+        )
+      })}
     </Box>
   )
 }

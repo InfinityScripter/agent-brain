@@ -51,6 +51,7 @@ declare module 'claude-code' {
       pending: BrainAction | null
       notice: string | null
       calls: Record<string, number>
+      open: string[]
     }
   }
 }

@@ -3,7 +3,7 @@ import type { Hook, Register } from 'claude-code'
 
 import type { BrainAction, BrainTab, BrainView } from '../types'
 import { formatTokens } from './charts'
-import { AreaHeader, HarnessCards, ShareBar } from './panel'
+import { AreaHeader, HarnessCards, ShareBar, SkillGroups } from './panel'
 import {
   applyProfileAction,
   buildView,
@@ -16,13 +16,13 @@ import {
 import type { DryRunJson, InspectJson, Listing, PrefsJson, ProfileJson } from './view'
 
 const PANE = 'agent-brain'
-const ROWS_SHOWN = 25
 
 const view = atom({ plugin: 'agent-brain', key: 'view' } as const, null)
 const tab = atom({ plugin: 'agent-brain', key: 'tab' } as const, 'skills')
 const pending = atom({ plugin: 'agent-brain', key: 'pending' } as const, null)
 const notice = atom({ plugin: 'agent-brain', key: 'notice' } as const, null)
 const calls = atom({ plugin: 'agent-brain', key: 'calls' } as const, {})
+const open = atom({ plugin: 'agent-brain', key: 'open' } as const, [])
 
 type Dollar = Parameters<Hook<'session.start'>>[0]
 
@@ -204,8 +204,11 @@ export const register: Register = on => {
     const action = await read($, pending)
     const message = await read($, notice)
     const sessionCalls = await read($, calls)
+    const openGroups = await read($, open)
     const setTab = (next: BrainTab) => () => update($, tab, () => next)
     const ask = (next: BrainAction) => () => update($, pending, () => next)
+    const toggleGroup = (label: string) =>
+      update($, open, groups => (groups.includes(label) ? groups.filter(item => item !== label) : [...groups, label]))
 
     if (current === null) return <Text dimColor>Загружаю данные Agent Brain…</Text>
 
@@ -292,17 +295,7 @@ export const register: Register = on => {
             </Text>
             <Text bold>Видны, но вне этой области</Text>
             {current.visibleOutside.length === 0 && <Text dimColor>Таких нет.</Text>}
-            {current.visibleOutside.slice(0, ROWS_SHOWN).map(row => (
-              <Box flexDirection="row" key={`row-${row.name}`}>
-                <Text wrap="truncate-end">
-                  {row.name} <Text dimColor>· {row.detail ?? 'без области'} · вызовов {row.calls}</Text>
-                </Text>
-                <Button key={`off-${row.name}`} plain label="Выключить здесь" onPress={ask(turnOffAction(current, row.name))} />
-              </Box>
-            ))}
-            {current.visibleOutside.length > ROWS_SHOWN && (
-              <Text dimColor>И ещё {current.visibleOutside.length - ROWS_SHOWN}: их спрячет профиль одной кнопкой выше.</Text>
-            )}
+            {SkillGroups(ui, current.groups, openGroups, toggleGroup, name => update($, pending, () => turnOffAction(current, name)))}
             <Text bold>Скиллы плагинов: по одному не спрятать</Text>
             {current.unhideable.length === 0 && <Text dimColor>Таких нет.</Text>}
             {current.unhideable.map(item => (

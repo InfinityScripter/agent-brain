@@ -448,3 +448,123 @@ test('with no earlier data an error shows alone; with earlier data the numbers s
   expect(await ui.find({ text: /Brain не ответил: ValueError: boom/ })).toBeDefined()
   await ui.unmount()
 })
+
+const outsideSkills = (groups: [label: string | null, level: string, count: number][]) => {
+  const skills = groups.flatMap(([label, level, count]) =>
+    Array.from({ length: count }, (_, index) => ({
+      listed_name: `${label ?? 'plain'}-${index}`,
+      scope_level: level,
+      scope_detail: label,
+      usage: { count: 0 },
+      hideable: true,
+      override: { effective: null, level: null },
+    })),
+  )
+  return {
+    noListing: true,
+    inspect: { ...INSPECT, skills },
+    dry: { hide: skills.map(skill => skill.listed_name), tokens: 90, unhideable_plugin_skills: ['superpowers:tdd'] },
+  }
+}
+
+const buttonKeys = async (ui: { findAll: (query: { type: string }) => Promise<{ key: string | undefined }[]> }, prefix: string) =>
+  (await ui.findAll({ type: 'Button' })).map(button => button.key).filter(key => key?.startsWith(prefix))
+
+test('more than five skills outside the area come as collapsed groups with a counter and a color mark', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on, outsideSkills([['work.yandex', 'domain', 3], ['tef-trigger-platform', 'project', 2], [null, 'global', 3]]))
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await buttonKeys(ui, 'off-')).toEqual([])
+  const headers = (await ui.findAll({ type: 'Button' })).filter(button => button.key?.startsWith('group-'))
+  expect(headers.map(button => [button.key, button.props.label])).toEqual([
+    ['group-work.yandex', 'work.yandex · скиллов: 3'],
+    ['group-tef-trigger-platform', 'tef-trigger-platform · скиллов: 2'],
+    ['group-без области', 'без области · скиллов: 3'],
+  ])
+  expect((await ui.find({ key: 'color-work.yandex' }))?.props.backgroundColor).toBe('#46a7ff')
+  expect((await ui.find({ key: 'color-tef-trigger-platform' }))?.props.backgroundColor).toBe('#45c79a')
+  expect((await ui.find({ key: 'color-без области' }))?.props.backgroundColor).toBe('#f2eddf')
+
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree.indexOf('Видны, но вне этой области')).toBeGreaterThan(-1)
+  expect(tree.indexOf('group-work.yandex')).toBeGreaterThan(tree.indexOf('Видны, но вне этой области'))
+  await ui.unmount()
+})
+
+test('pressing a group header shows its rows with turn-off buttons, pressing it again hides them', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on, outsideSkills([['work.yandex', 'domain', 3], ['tef-trigger-platform', 'project', 2], [null, 'global', 3]]))
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'group-work.yandex' })
+  expect(await buttonKeys(ui, 'off-')).toEqual(['off-work.yandex-0', 'off-work.yandex-1', 'off-work.yandex-2'])
+  expect(await ui.find({ text: 'work.yandex-1 · work.yandex · вызовов 0' })).toBeDefined()
+  expect(await ui.find({ text: 'Скиллы плагинов: по одному не спрятать' })).toBeDefined()
+  expect(await ui.find({ text: /superpowers:tdd/ })).toBeDefined()
+
+  await ui.press({ key: 'group-work.yandex' })
+  expect(await buttonKeys(ui, 'off-')).toEqual([])
+  await ui.unmount()
+})
+
+test('an open group shows at most 25 rows and says how many more the profile hides', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on, outsideSkills([['work.yandex', 'domain', 27]]))
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'group-work.yandex' })
+  const keys = await buttonKeys(ui, 'off-')
+  expect(keys.length).toBe(25)
+  expect(keys.at(-1)).toBe('off-work.yandex-24')
+  expect(await ui.find({ type: 'Text', text: 'И ещё 2 в этой группе: их спрячет профиль одной кнопкой' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('five skills outside the area come as open groups, six come collapsed', async ($, on) => {
+  const clock = mock.clock(on)
+  const world: World = outsideSkills([['work.yandex', 'domain', 3], ['tef-trigger-platform', 'project', 2]])
+  brainWorld(on, world)
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await buttonKeys(ui, 'group-')).toEqual(['group-work.yandex', 'group-tef-trigger-platform'])
+  expect((await buttonKeys(ui, 'off-')).length).toBe(5)
+
+  Object.assign(world, outsideSkills([['work.yandex', 'domain', 4], ['tef-trigger-platform', 'project', 2]]))
+  await ui.press({ key: 'reload' })
+  await clock.settle()
+  expect(await buttonKeys(ui, 'group-')).toEqual(['group-work.yandex', 'group-tef-trigger-platform'])
+  expect(await buttonKeys(ui, 'off-')).toEqual([])
+  await ui.unmount()
+})
+
+test('an opened group stays open after a refresh and after a finished action, and turning a skill off still asks first', async ($, on) => {
+  const clock = mock.clock(on)
+  const world = brainWorld(on, outsideSkills([['work.yandex', 'domain', 3], ['tef-trigger-platform', 'project', 2], [null, 'global', 3]]))
+  const offs = () => world.runs.filter(args => args[0] === 'skill')
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'group-tef-trigger-platform' })
+  await ui.press({ key: 'reload' })
+  await clock.settle()
+  expect(await buttonKeys(ui, 'off-')).toEqual(['off-tef-trigger-platform-0', 'off-tef-trigger-platform-1'])
+
+  await ui.press({ key: 'off-tef-trigger-platform-0' })
+  expect(offs()).toEqual([])
+  await ui.press({ key: 'confirm' })
+  await clock.settle()
+  expect(offs()).toEqual([['skill', 'off', 'tef-trigger-platform-0', '--settings', 'local', '--cwd', CWD]])
+  expect(await ui.find({ text: /Готово/ })).toBeDefined()
+  expect(await buttonKeys(ui, 'off-')).toEqual(['off-tef-trigger-platform-0', 'off-tef-trigger-platform-1'])
+  await ui.unmount()
+})
