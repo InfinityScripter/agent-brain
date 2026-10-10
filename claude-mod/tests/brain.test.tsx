@@ -50,7 +50,15 @@ const PANE = {
 } as const
 const RUN_BRAIN = { command: 'brain', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 120 } } as never
 
-type World = { profile?: object; failing?: string; missingBrain?: boolean; brokenInspect?: boolean }
+type World = {
+  profile?: object
+  failing?: string
+  missingBrain?: boolean
+  brokenInspect?: boolean
+  inspect?: object
+  dry?: object
+  noListing?: boolean
+}
 
 function brainWorld(on: On, world: World = {}) {
   const runs: string[][] = []
@@ -80,13 +88,15 @@ function brainWorld(on: On, world: World = {}) {
   )
   on('session.cwd', () => ({ value: CWD }))
   on('session.usage', () => ({
-    value: {
-      context: {
-        breakdown: {
-          skills: { totalSkills: 7, includedSkills: 5, skillFrontmatter: LISTING.map(name => ({ name })) },
+    value: world.noListing
+      ? { context: {} }
+      : {
+          context: {
+            breakdown: {
+              skills: { totalSkills: 7, includedSkills: 5, skillFrontmatter: LISTING.map(name => ({ name })) },
+            },
+          },
         },
-      },
-    },
   }) as never)
   on('prompt.submit', (_$, e) => ({ text: e.text }))
   on('skill.prompt', (_$, e) => ({ text: e.text }))
@@ -94,10 +104,10 @@ function brainWorld(on: On, world: World = {}) {
     const args = e.argv.slice(1)
     runs.push(args)
     const replies: Record<string, unknown> = {
-      inspect: INSPECT,
+      inspect: world.inspect ?? INSPECT,
       profile: world.profile ?? NOT_APPLIED,
       prefs: PREFS,
-      use: args.includes('--dry-run') ? DRY_RUN : null,
+      use: args.includes('--dry-run') ? (world.dry ?? DRY_RUN) : null,
     }
     const reply = replies[args[0] ?? '']
     const fails = args[0] === world.failing
@@ -260,5 +270,181 @@ test('the model is sent from a plugin duplicate to the preferred skill; typed an
   expect(await ui.find({ text: 'superpowers:tdd: 2' })).toBeDefined()
   expect(await ui.find({ text: 'lavish: 1' })).toBeDefined()
   expect(await ui.find({ text: /^brain:/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+const META_INSPECT = {
+  ...INSPECT,
+  context: {
+    domain: 'meta.agent-system',
+    source: 'project',
+    chain: ['meta', 'meta.agent-system', 'project:agent-brain'],
+    project: { id: 'agent-brain' },
+  },
+}
+const FRESH = { domain: 'personal.software', applied: { domain: 'personal.software', level: 'local' }, stale: false, missing: [], wrongly_hidden: [], command: null }
+
+test('the header shows the area and its chain as badges in the area colors, on every surface', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on, { inspect: META_INSPECT })
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const badges = (await ui.findAll({ type: 'Box' }))
+      .filter(box => box.props.backgroundColor && box.text)
+      .map(box => [box.text, box.props.backgroundColor])
+    expect(badges.slice(0, 4)).toEqual([
+      ['meta.agent-system', '#9c83ff'],
+      ['meta', '#9c83ff'],
+      ['meta.agent-system', '#9c83ff'],
+      ['project:agent-brain', '#45c79a'],
+    ])
+    for (const type of ['Svg', 'Raster', 'Image']) expect(await ui.findAll({ type })).toEqual([])
+    await ui.unmount()
+  }
+})
+
+test('the bar splits what the model sees into whole percents that add up to 100, with a legend', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on)
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const segments = (await ui.findAll({ type: 'Box' })).filter(box => box.props.backgroundColor && typeof box.props.width === 'string')
+  expect(segments.map(box => [box.props.width, box.props.backgroundColor, box.props.minWidth])).toEqual([
+    ['50%', '#f3b64b', 1],
+    ['17%', '#ff6b5f', 1],
+    ['17%', '#69d3c5', 1],
+    ['16%', '#8c93a4', 1],
+  ])
+  for (const text of ['Модель видит 5', '3 в области', '1 вне области', '1 плагинные', '1 уже спрятаны вне области']) {
+    expect(await ui.find({ type: 'Text', text })).toBeDefined()
+  }
+  await ui.unmount()
+})
+
+test('without the list of skills the model sees, the bar has no in-area part and says so', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on, { noListing: true })
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const segments = (await ui.findAll({ type: 'Box' })).filter(box => box.props.backgroundColor && typeof box.props.width === 'string')
+  expect(segments.map(box => [box.props.width, box.props.backgroundColor])).toEqual([
+    ['50%', '#ff6b5f'],
+    ['25%', '#69d3c5'],
+    ['25%', '#8c93a4'],
+  ])
+  expect(await ui.find({ type: 'Text', text: 'Сколько скиллов видит модель, неизвестно' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '2 вне области' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^\d+ в области$/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('with nothing outside the area the bar keeps in-area and hidden, and the legend has no zeros', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on, { dry: { hide: ['arc'], tokens: 90, unhideable_plugin_skills: [] } })
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const segments = (await ui.findAll({ type: 'Box' })).filter(box => box.props.backgroundColor && typeof box.props.width === 'string')
+  expect(segments.map(box => [box.props.width, box.props.backgroundColor])).toEqual([
+    ['83%', '#f3b64b'],
+    ['17%', '#8c93a4'],
+  ])
+  expect(await ui.find({ type: 'Text', text: '5 в области' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '1 уже спрятаны вне области' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^0 / })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a profile that is not applied says how many skills it would hide and the tokens it would save', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on, { dry: { ...DRY_RUN, tokens: 12415 } })
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Профиль спрячет 3 скиллов и сэкономит около 12,4 тыс\. токенов/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a fresh profile says how many skills it already hides and the tokens that is', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on, { profile: FRESH })
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Профиль уже прячет 3 скиллов, это около 90 токенов/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a stale profile keeps its own sentence and promises no savings', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on, { profile: STALE })
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Профиль папки «personal\.software» устарел: 1 скиллов видны вне области, 0 спрятаны зря\./ })).toBeDefined()
+  expect(await ui.find({ text: /сэкономит|уже прячет/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('four cards count rules, MCP servers, agents and instruction files, with the old line under them', async ($, on) => {
+  const clock = mock.clock(on)
+  brainWorld(on)
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const cards = (await ui.findAll({ type: 'Box' })).filter(box => box.props.borderStyle === 'round')
+    expect(cards.length).toBe(4)
+    for (const title of ['Правила', 'MCP-серверы', 'Агенты', 'Файлы инструкций']) {
+      expect(await ui.find({ type: 'Text', text: title })).toBeDefined()
+    }
+    expect(cards[0]?.text).toMatch(/выключено 1/)
+    const row = (await ui.findAll({ type: 'Box' })).find(box => box.props.flexWrap === 'wrap' && box.children.length === 4)
+    expect(row).toBeDefined()
+    expect(
+      await ui.find({ type: 'Text', text: 'Здесь: правил 2, выключено 1; MCP-серверов 1; агентов 0; файлов инструкций 1.' }),
+    ).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('with no earlier data an error shows alone; with earlier data the numbers stay beside the error', async ($, on) => {
+  const clock = mock.clock(on)
+  const world: World = { failing: 'inspect' }
+  brainWorld(on, world)
+  await $.command.run(RUN_BRAIN)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const drawn = async () => ({
+    segments: (await ui.findAll({ type: 'Box' })).filter(box => box.props.backgroundColor && typeof box.props.width === 'string').length,
+    cards: (await ui.findAll({ type: 'Box' })).filter(box => box.props.borderStyle === 'round').length,
+  })
+  expect(await ui.find({ text: /Brain не ответил: ValueError: boom/ })).toBeDefined()
+  expect(await drawn()).toEqual({ segments: 0, cards: 0 })
+
+  world.failing = undefined
+  await ui.press({ key: 'reload' })
+  await clock.settle()
+  expect(await drawn()).toEqual({ segments: 4, cards: 4 })
+  expect(await ui.find({ text: /Brain не ответил/ })).toBeUndefined()
+
+  world.failing = 'inspect'
+  await ui.press({ key: 'reload' })
+  await clock.settle()
+  expect(await drawn()).toEqual({ segments: 4, cards: 4 })
+  expect(await ui.find({ text: /Brain не ответил: ValueError: boom/ })).toBeDefined()
   await ui.unmount()
 })

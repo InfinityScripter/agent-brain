@@ -1,6 +1,8 @@
 export type BrainTab = 'skills' | 'dupes' | 'calls' | 'advice'
 
-export type BrainSkillRow = { name: string; detail: string | null; calls: number }
+export type BrainSkillRow = { name: string; detail: string | null; level: string | null; calls: number }
+
+export type BrainGroup = { label: string; level: string | null; skills: BrainSkillRow[] }
 
 export type BrainDupe = { task: string; use: string; insteadOf: string[]; applies: boolean }
 
@@ -15,6 +17,7 @@ export type BrainProfile = {
 
 export type BrainView = {
   status: 'loading' | 'ready' | 'error'
+  hasData: boolean
   error: string | null
   cwd: string
   root: string
@@ -26,6 +29,7 @@ export type BrainView = {
   hideCount: number
   hideTokens: number
   visibleOutside: BrainSkillRow[]
+  groups: BrainGroup[]
   hiddenAlready: number
   unhideable: { name: string; instead: string | null }[]
   profile: BrainProfile

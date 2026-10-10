@@ -1,4 +1,4 @@
-import type { BrainAction, BrainDupe, BrainProfile, BrainView } from '../types'
+import type { BrainAction, BrainDupe, BrainGroup, BrainProfile, BrainSkillRow, BrainView } from '../types'
 
 type Override = { effective: string | null; level: string | null }
 
@@ -7,6 +7,7 @@ export type InspectJson = {
   root: string
   skills: {
     listed_name: string
+    scope_level: string
     scope_detail: string | null
     usage: { count: number }
     hideable: boolean
@@ -45,6 +46,7 @@ const REASONS: Record<string, string> = {
 }
 
 const HIDDEN = new Set(['off', 'user-invocable-only'])
+const NO_AREA = 'без области'
 
 export function preferredInstead(prefs: PrefsJson | null, name: string): string | null {
   const row = prefs?.preferences.find(item => item.applies && (item.instead_of ?? []).includes(name))
@@ -68,10 +70,19 @@ export function buildView(
   const outside = dry.hide.filter(name => !isHidden(name) && (listed === null || listed.names.includes(name)))
   const calls = new Map<string, number>()
   for (const skill of inspect.skills) calls.set(skill.listed_name, Math.max(calls.get(skill.listed_name) ?? 0, skill.usage.count))
+  const visibleOutside = outside.map(
+    (name): BrainSkillRow => ({
+      name,
+      detail: byName.get(name)?.scope_detail ?? null,
+      level: byName.get(name)?.scope_level ?? null,
+      calls: calls.get(name) ?? 0,
+    }),
+  )
   const context = inspect.context
 
   return {
     status: 'ready',
+    hasData: true,
     error: null,
     cwd,
     root: inspect.root,
@@ -82,11 +93,8 @@ export function buildView(
     listedTotal: listed?.total ?? null,
     hideCount: dry.hide.length,
     hideTokens: dry.tokens,
-    visibleOutside: outside.map(name => ({
-      name,
-      detail: byName.get(name)?.scope_detail ?? null,
-      calls: calls.get(name) ?? 0,
-    })),
+    visibleOutside,
+    groups: groupSkills(visibleOutside),
     hiddenAlready: dry.hide.filter(isHidden).length,
     unhideable: dry.unhideable_plugin_skills.map(name => ({ name, instead: preferredInstead(prefs, name) })),
     profile: toProfile(profile),
@@ -111,6 +119,17 @@ export function buildView(
       instructions: inspect.instructions.length,
     },
   }
+}
+
+function groupSkills(rows: BrainSkillRow[]): BrainGroup[] {
+  const byLabel = new Map<string, BrainGroup>()
+  for (const row of rows) {
+    const label = row.detail ?? NO_AREA
+    const group = byLabel.get(label) ?? { label, level: row.level, skills: [] }
+    group.skills.push(row)
+    byLabel.set(label, group)
+  }
+  return [...byLabel.values()].sort((a, b) => Number(a.label === NO_AREA) - Number(b.label === NO_AREA) || b.skills.length - a.skills.length)
 }
 
 function toProfile(profile: ProfileJson): BrainProfile {

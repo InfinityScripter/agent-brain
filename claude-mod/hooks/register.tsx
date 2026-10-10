@@ -2,6 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { Hook, Register } from 'claude-code'
 
 import type { BrainAction, BrainTab, BrainView } from '../types'
+import { formatTokens } from './charts'
+import { AreaHeader, HarnessCards, ShareBar } from './panel'
 import {
   applyProfileAction,
   buildView,
@@ -126,8 +128,8 @@ async function load($: Dollar): Promise<void> {
 
 function errorView(cwd: string, message: string): BrainView {
   return {
-    status: 'error', error: message, cwd, root: cwd, domain: '—', domainReason: 'неизвестно', chain: [],
-    listedCount: null, listedTotal: null, hideCount: 0, hideTokens: 0, visibleOutside: [], hiddenAlready: 0,
+    status: 'error', hasData: false, error: message, cwd, root: cwd, domain: '—', domainReason: 'неизвестно', chain: [],
+    listedCount: null, listedTotal: null, hideCount: 0, hideTokens: 0, visibleOutside: [], groups: [], hiddenAlready: 0,
     unhideable: [], profile: { domain: null, level: null, stale: false, missing: [], wronglyHidden: [], command: null },
     dupes: [], topCalls: [], recommended: [], gaps: [], warnings: [],
     harness: { rules: 0, rulesOff: 0, mcp: 0, agents: 0, instructions: 0 },
@@ -195,7 +197,8 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const ui = $.ui.resolve(e)
+    const { Box, Text, Button } = ui
     const current = await read($, view)
     const shownTab = await read($, tab)
     const action = await read($, pending)
@@ -206,16 +209,27 @@ export const register: Register = on => {
 
     if (current === null) return <Text dimColor>Загружаю данные Agent Brain…</Text>
 
-    const header = (
+    const status = (
       <Box flexDirection="column">
-        <Text bold>{current.domain}</Text>
-        <Text dimColor wrap="wrap">Почему: {current.domainReason}. Цепочка: {current.chain.join(', ') || '—'}.</Text>
-        <Text dimColor wrap="wrap">
-          Здесь: правил {current.harness.rules}, выключено {current.harness.rulesOff}; MCP-серверов {current.harness.mcp}; агентов {current.harness.agents}; файлов инструкций {current.harness.instructions}.
-        </Text>
         {current.status === 'loading' && <Text dimColor>Обновляю…</Text>}
         {current.status === 'error' && <Text color="error" wrap="wrap">Brain не ответил: {current.error}</Text>}
         {current.warnings.map(text => <Text color="warning" wrap="wrap">{text}</Text>)}
+      </Box>
+    )
+
+    if (!current.hasData) {
+      return (
+        <Box flexDirection="column" gap={1}>
+          {status}
+          <Button key="reload" label="Обновить" onPress={() => load($)} />
+        </Box>
+      )
+    }
+
+    const header = (
+      <Box flexDirection="column">
+        {AreaHeader(ui, current)}
+        {status}
       </Box>
     )
 
@@ -235,14 +249,14 @@ export const register: Register = on => {
       )
     }
 
-    const seen = current.listedCount === null ? '' : ` Модель видит ${current.listedCount} скиллов.`
     const isShared = current.profile.level === 'user'
+    const tokens = formatTokens(current.hideTokens)
     const profileLine = current.profile.stale
       ? `${isShared ? 'Общий профиль' : 'Профиль папки'} «${current.profile.domain}» устарел: ${current.profile.missing.length} скиллов видны вне области, ${current.profile.wronglyHidden.length} спрятаны зря.` +
         (isShared ? ` Общий профиль меняет все сессии, обновить его: ${current.profile.command}.` : '')
       : current.profile.domain
-        ? `${isShared ? 'Общий профиль' : 'Профиль папки'} «${current.profile.domain}» применён и свежий.`
-        : `Профиль не применён.${seen} Профиль этой области спрятал бы ${current.hideCount}, около ${current.hideTokens} токенов.`
+        ? `${isShared ? 'Общий профиль' : 'Профиль папки'} «${current.profile.domain}» применён и свежий. Профиль уже прячет ${current.hideCount} скиллов, это около ${tokens} токенов.`
+        : `Профиль не применён. Профиль спрячет ${current.hideCount} скиллов и сэкономит около ${tokens} токенов.`
     const canApply = (current.profile.level !== 'local' || current.profile.stale) && current.hideCount > 0
     const overflow =
       current.listedTotal !== null && current.listedCount !== null && current.listedTotal > current.listedCount
@@ -252,12 +266,18 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         {header}
-        <Text wrap="wrap">{profileLine}</Text>
-        {canApply && (
-          <Button key="apply" variant="primary" label={current.profile.stale && !isShared ? 'Обновить профиль папки…' : 'Применить к этой папке…'} onPress={ask(applyProfileAction(current))} />
-        )}
+        <Box flexDirection="column" marginTop={1}>
+          {ShareBar(ui, current)}
+          <Text wrap="wrap">{profileLine}</Text>
+          {canApply && (
+            <Button key="apply" variant="primary" label={current.profile.stale && !isShared ? 'Обновить профиль папки…' : 'Применить к этой папке…'} onPress={ask(applyProfileAction(current))} />
+          )}
+        </Box>
         {message && <Text dimColor wrap="wrap">{message}</Text>}
-        <Box flexDirection="row" flexWrap="wrap" gap={1}>
+        <Box flexDirection="column" marginTop={1}>
+          {HarnessCards(ui, current.harness)}
+        </Box>
+        <Box flexDirection="row" flexWrap="wrap" gap={1} marginTop={1}>
           <Button key="tab-skills" label="Скиллы" variant={shownTab === 'skills' ? 'primary' : 'secondary'} onPress={setTab('skills')} />
           <Button key="tab-dupes" label="Дубли" variant={shownTab === 'dupes' ? 'primary' : 'secondary'} onPress={setTab('dupes')} />
           <Button key="tab-calls" label="Вызовы" variant={shownTab === 'calls' ? 'primary' : 'secondary'} onPress={setTab('calls')} />
