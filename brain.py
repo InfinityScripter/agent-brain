@@ -40,6 +40,7 @@ REGISTRY_DIR = Path(
 CONFIG_PATH = REGISTRY_DIR / "config" / "brain.json"
 DATA_PATH = REGISTRY_DIR / "data" / "inventory.json"
 STATE_PATH = REGISTRY_DIR / "state" / "active-context.json"
+PROFILES_PATH = REGISTRY_DIR / "state" / "profiles.json"
 TEMPLATE_PATH = ENGINE_DIR / "web" / "index.template.html"
 VIEW_PATH = REGISTRY_DIR / "views" / "index.html"
 CANVAS_PATH = REGISTRY_DIR / "views" / "agent-brain.canvas"
@@ -50,6 +51,8 @@ CLAUDE_STATE_PATH = Path.home() / ".claude.json"
 CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 CLAUDE_PLUGINS_DIR = Path.home() / ".claude" / "plugins"
 IDLE_DAYS_THRESHOLD = 30
+# Bumped when the engine adds inventory fields, so a cached inventory is rebuilt.
+INVENTORY_REVISION = 2
 
 IGNORED_SCAN_DIRS = {
     ".git",
@@ -74,11 +77,12 @@ SCOPE_SCORE = {
 
 
 def configure_paths(registry: Path) -> None:
-    global REGISTRY_DIR, CONFIG_PATH, DATA_PATH, STATE_PATH, VIEW_PATH, CANVAS_PATH, AUDIT_PATH, RELATIONS_PATH
+    global REGISTRY_DIR, CONFIG_PATH, DATA_PATH, STATE_PATH, PROFILES_PATH, VIEW_PATH, CANVAS_PATH, AUDIT_PATH, RELATIONS_PATH
     REGISTRY_DIR = safe_resolve(registry.expanduser())
     CONFIG_PATH = REGISTRY_DIR / "config" / "brain.json"
     DATA_PATH = REGISTRY_DIR / "data" / "inventory.json"
     STATE_PATH = REGISTRY_DIR / "state" / "active-context.json"
+    PROFILES_PATH = REGISTRY_DIR / "state" / "profiles.json"
     VIEW_PATH = REGISTRY_DIR / "views" / "index.html"
     CANVAS_PATH = REGISTRY_DIR / "views" / "agent-brain.canvas"
     AUDIT_PATH = REGISTRY_DIR / "reports" / "audit.md"
@@ -664,57 +668,220 @@ def listing_name(skill: Dict[str, Any]) -> str:
     return f"{plugin}:{skill['name']}" if plugin else skill["name"]
 
 
-def skill_listing_overrides(inventory: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, str]:
-    """Hide out-of-context skills from the model while keeping /name working.
+def listed_out_of_context(inventory: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, bool]:
+    """Listed names the context would hide, each mapped to whether a plugin provides it.
 
-    Overrides are keyed by listed name, so a name shared with a skill that is
-    active here stays untouched — hiding it would take the active one down too.
+    Keyed by listed name, so a name shared with a skill that is active here is
+    left out — hiding it would take the active one down too. Archived copies
+    count: archive means "never selected automatically".
     """
 
     installed_plugins = set(context.get("active_plugins", []))
     listed: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for skill in inventory["skills"]:
-        scope = skill["scope"]
-        if scope["level"] == "archive" or not skill.get("model_invocable", True):
+        if not skill.get("model_invocable", True):
             continue
-        if "claude" not in skill["runtimes"]:
+        if "claude" not in skill.get("loaded_runtimes", skill["runtimes"]):
             continue
-        # A disabled plugin is already absent from the listing; overriding it is noise.
-        plugin = skill.get("plugin_source") or scope.get("plugin")
+        # A disabled plugin is already absent from the listing.
+        plugin = skill.get("plugin_source") or skill["scope"].get("plugin")
         if plugin and plugin not in installed_plugins:
             continue
         listed[listing_name(skill)].append(skill)
 
     return {
-        name: "user-invocable-only"
+        name: any(skill.get("plugin_source") or skill["scope"].get("plugin") for skill in candidates)
         for name, candidates in sorted(listed.items())
         if not any(skill_is_active(skill, context) for skill in candidates)
     }
 
 
-def write_skill_overrides(overrides: Dict[str, str], settings_path: Optional[Path] = None) -> Path:
+def skill_listing_overrides(inventory: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, str]:
+    """Hide out-of-context skills from the model while keeping /name working."""
+
+    return {
+        name: "user-invocable-only"
+        for name, is_plugin in listed_out_of_context(inventory, context).items()
+        if not is_plugin
+    }
+
+
+def unhideable_plugin_skills(inventory: Dict[str, Any], context: Dict[str, Any]) -> List[str]:
+    """Out-of-context plugin skills: Claude Code ignores skillOverrides for them,
+    so only turning the whole plugin off removes them from the listing."""
+
+    return [name for name, is_plugin in listed_out_of_context(inventory, context).items() if is_plugin]
+
+
+def read_settings_for_write(path: Path) -> Dict[str, Any]:
+    """A settings file about to be rewritten. A parse failure aborts: writing
+    over an unreadable file would silently drop everything else kept in it."""
+
+    if not path.is_file():
+        return {}
+    try:
+        settings = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(f"Cannot parse {path} ({error}); fix or remove it first.")
+    if not isinstance(settings, dict):
+        raise ValueError(f"{path} is not a JSON object; refusing to overwrite it.")
+    return settings
+
+
+def write_skill_overrides(
+    overrides: Dict[str, str], settings_path: Optional[Path] = None, previous: Iterable[str] = ()
+) -> Path:
     """Write the profile's skillOverrides block, backing the file up.
 
-    Manual per-skill toggles ("on"/"off", written by ``brain skill``) survive
-    the rewrite and win over the profile; only the profile-managed
-    "user-invocable-only" entries are replaced.
+    Only the entries brain wrote last time (``previous``) are dropped. Every
+    other entry survives and wins over the profile: a manual on/off from
+    ``brain skill`` and a choice made in Claude Code's /skills menu, which
+    writes the same "user-invocable-only" value.
     """
 
     path = settings_path if settings_path is not None else CLAUDE_SETTINGS_PATH
-    settings = read_settings_file(path)
+    settings = read_settings_for_write(path)
     existing = settings.get("skillOverrides")
-    manual = (
-        {key: value for key, value in existing.items() if value in TOGGLE_ACTIONS}
+    written_before = set(previous)
+    kept = (
+        {
+            key: value
+            for key, value in existing.items()
+            if not (key in written_before and value == "user-invocable-only")
+        }
         if isinstance(existing, dict)
         else {}
     )
-    merged = {**overrides, **manual}
+    merged = {**overrides, **kept}
     if merged:
         settings["skillOverrides"] = merged
     else:
         settings.pop("skillOverrides", None)
     write_settings_file(path, settings)
     return path
+
+
+def read_profiles() -> Dict[str, Dict[str, Any]]:
+    """Profiles brain applied, keyed by the settings file it wrote them to.
+
+    An unreadable record is an error, not an empty one: rewriting it would
+    lose every other folder's record, and brain would then never remove what
+    it hid there.
+    """
+
+    if not PROFILES_PATH.is_file():
+        return {}
+    try:
+        profiles = read_json(PROFILES_PATH).get("profiles")
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(f"Cannot read {PROFILES_PATH} ({error}); fix or remove it first.")
+    if not isinstance(profiles, dict) or not all(isinstance(item, dict) for item in profiles.values()):
+        raise ValueError(f"{PROFILES_PATH} has an unexpected shape; fix or remove it first.")
+    return profiles
+
+
+def write_profiles(profiles: Dict[str, Dict[str, Any]]) -> None:
+    write_json(PROFILES_PATH, {"schema_version": "agent-brain.profiles.v1", "profiles": profiles})
+
+
+def record_profile(settings_path: Path, domain: str, cwd: Path, hidden: Sequence[str]) -> None:
+    profiles = read_profiles()
+    profiles[str(safe_resolve(settings_path))] = {
+        "domain": domain,
+        "cwd": str(safe_resolve(cwd)),
+        "hidden": list(hidden),
+        "applied_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_profiles(profiles)
+
+
+def forget_profile(settings_path: Path) -> None:
+    profiles = read_profiles()
+    if profiles.pop(str(safe_resolve(settings_path)), None) is not None:
+        write_profiles(profiles)
+
+
+def profile_context(cwd: Path, inventory: Dict[str, Any], domain: str, level: str) -> Dict[str, Any]:
+    """The context a profile is computed in.
+
+    A user-wide profile switches the domain everywhere. A folder profile
+    applies the folder's own domain and keeps its project, whose skills must
+    stay visible there; the folder's domain comes from the registry alone.
+    """
+
+    if level != "local":
+        return resolve_context(cwd, inventory, explicit_domain=domain)
+    context = resolve_context(cwd, inventory)
+    if domain != context["domain"]:
+        raise ValueError(
+            f"{safe_resolve(cwd)} resolves to {context['domain']} ({context['source']}); a folder profile applies "
+            "the folder's own domain. Register the folder or add a domain path rule to change it."
+        )
+    return context
+
+
+def profile_status(cwd: Path, inventory: Dict[str, Any], home: Optional[Path] = None) -> Dict[str, Any]:
+    """Whether the profile that applies in ``cwd`` still matches the skills on disk.
+
+    Claude Code reads the .claude settings of the session folder itself, never
+    a parent's, so the folder's own profile wins over the user-wide one.
+    """
+
+    root = safe_resolve(cwd)
+    chain = settings_chain(root, home)
+    for item in chain:
+        overrides = read_settings_file(item["path"]).get("skillOverrides")
+        item["overrides"] = overrides if isinstance(overrides, dict) else {}
+        item["path"] = str(safe_resolve(item["path"]))
+    status: Dict[str, Any] = {
+        "cwd": str(root),
+        "domain": resolve_context(root, inventory)["domain"],
+        "applied": None,
+        "stale": False,
+        "missing": [],
+        "wrongly_hidden": [],
+        "unhideable_plugin_skills": [],
+        "command": None,
+    }
+    profiles = read_profiles()
+    target = next(
+        (item for level in ("local", "user") for item in chain if item["level"] == level and item["path"] in profiles),
+        None,
+    )
+    if target is None:
+        return status
+
+    applied = dict(profiles[target["path"]], level=target["level"], settings_path=target["path"])
+    if target["level"] == "local":
+        context = resolve_context(root, inventory)
+    else:
+        context = resolve_context(root, inventory, explicit_domain=applied["domain"])
+    wanted = skill_listing_overrides(inventory, context)
+    hidden = {
+        name
+        for item in chain
+        for name in item["overrides"]
+        if effective_override(name, chain)["effective"] in ("user-invocable-only", "off")
+    }
+    # A manual "on" is the user's choice; refreshing the profile would not change it.
+    missing = sorted(name for name in set(wanted) - hidden if effective_override(name, chain)["effective"] != "on")
+    wrongly_hidden = sorted(
+        name
+        for name in applied["hidden"]
+        if name not in wanted and effective_override(name, chain)["effective"] == "user-invocable-only"
+    )
+    command = f"brain use {context['domain']}"
+    if target["level"] == "local":
+        command += f" --settings local --cwd {root}"
+    status.update(
+        applied=applied,
+        stale=bool(missing or wrongly_hidden),
+        missing=missing,
+        wrongly_hidden=wrongly_hidden,
+        unhideable_plugin_skills=unhideable_plugin_skills(inventory, context),
+        command=command,
+    )
+    return status
 
 
 def read_listing_limits(settings_path: Optional[Path] = None) -> Dict[str, Optional[float]]:
@@ -935,13 +1102,32 @@ def harness_listed(skill: Dict[str, Any], installed_plugins: set) -> bool:
     Claude-relevant too; only pure codex-only mounts stay out of the picture.
     """
 
-    scope = skill["scope"]
-    if scope["level"] == "archive" or not skill.get("model_invocable", True):
+    if not skill.get("model_invocable", True):
         return False
-    if not set(skill.get("runtimes") or ["claude"]) & CLAUDE_RELEVANT_RUNTIMES:
+    if not set(skill.get("loaded_runtimes", skill.get("runtimes") or ["claude"])) & CLAUDE_RELEVANT_RUNTIMES:
         return False
-    plugin = skill.get("plugin_source") or scope.get("plugin")
+    plugin = skill.get("plugin_source") or skill["scope"].get("plugin")
     return not plugin or plugin in installed_plugins
+
+
+def parent_override_warnings(root: Path, home: Optional[Path] = None) -> List[str]:
+    """Overrides in a parent folder's .claude settings, which Claude Code never
+    reads for a session started in ``root``."""
+
+    base = safe_resolve(home or Path.home())
+    warnings = []
+    cursor = safe_resolve(root).parent
+    while cursor != base and is_relative_to(cursor, base):
+        for name in ("settings.json", "settings.local.json"):
+            path = cursor / ".claude" / name
+            overrides = read_settings_file(path).get("skillOverrides")
+            if isinstance(overrides, dict) and overrides:
+                warnings.append(
+                    f"{path} sets {len(overrides)} skill overrides, but Claude Code does not read it in {root}: "
+                    "folder settings apply only to sessions started in that folder."
+                )
+        cursor = cursor.parent
+    return warnings
 
 
 def harness_inventory(cwd: Path, inventory: Dict[str, Any], home: Optional[Path] = None) -> Dict[str, Any]:
@@ -967,6 +1153,8 @@ def harness_inventory(cwd: Path, inventory: Dict[str, Any], home: Optional[Path]
         listed = listing_name(skill)
         active = skill_is_active(skill, context)
         override = effective_override(listed, chain)
+        # Claude Code ignores skillOverrides for plugin skills: a running plugin lists them all.
+        hideable = not (skill.get("plugin_source") or scope.get("plugin"))
         skills.append(
             {
                 "listed_name": listed,
@@ -978,9 +1166,10 @@ def harness_inventory(cwd: Path, inventory: Dict[str, Any], home: Optional[Path]
                 "usage": skill.get("usage") or {"count": 0, "last_used": None},
                 "active": active,
                 "override": override,
+                "hideable": hideable,
                 # An explicit "on" override forces the runtime listing even
                 # when the registry scopes the skill elsewhere.
-                "visible": override["effective"] == "on" or (active and override["effective"] != "off"),
+                "visible": not hideable or override["effective"] == "on" or (active and override["effective"] != "off"),
             }
         )
     skills.sort(key=lambda item: (not item["active"], item["listed_name"]))
@@ -994,6 +1183,7 @@ def harness_inventory(cwd: Path, inventory: Dict[str, Any], home: Optional[Path]
         "instructions": instruction_chain(cwd, home),
         "agents": agents_inventory(root, home),
         "mcp": mcp_inventory(root, home),
+        "warnings": parent_override_warnings(safe_resolve(cwd), home),
     }
 
 
@@ -1003,24 +1193,21 @@ def toggle_skill(name: str, action: str, settings_path: Path, inventory: Dict[st
     if action not in TOGGLE_ACTIONS:
         raise ValueError(f"Unknown action: {action}. Expected one of {TOGGLE_ACTIONS}.")
     installed_plugins = set(inventory.get("config", {}).get("active_plugins") or [])
-    listed_names = {
-        listing_name(skill)
+    listed = {
+        listing_name(skill): skill
         for skill in inventory["skills"]
         if harness_listed(skill, installed_plugins)
     }
-    if name not in listed_names:
+    if name not in listed:
         raise ValueError(f"Unknown skill: {name}. The name must match the runtime listing.")
-    if settings_path.is_file():
-        # A parse failure must abort: writing over an unreadable settings file
-        # would silently drop everything else the user keeps in it.
-        try:
-            settings = read_json(settings_path)
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            raise ValueError(f"Cannot parse {settings_path} ({error}); fix or remove it before toggling.")
-        if not isinstance(settings, dict):
-            raise ValueError(f"{settings_path} is not a JSON object; refusing to overwrite it.")
-    else:
-        settings = {}
+    plugin = listed[name].get("plugin_source") or listed[name]["scope"].get("plugin")
+    if plugin:
+        raise ValueError(
+            f"{name} comes from the {plugin} plugin. Claude Code ignores skillOverrides for plugin skills "
+            f"(https://code.claude.com/docs/en/skills); only the whole plugin can be turned off: "
+            f"claude plugin disable {plugin}"
+        )
+    settings = read_settings_for_write(settings_path)
     overrides = settings.get("skillOverrides")
     if not isinstance(overrides, dict):
         overrides = {}
@@ -1315,6 +1502,9 @@ def collect_skill_occurrences(
             scope = classify_scope(metadata["name"], source_dir, config, projects, declared_project)
             occurrences.append(
                 {
+                    # Claude Code reads a skill folder only at the top of a root,
+                    # or where a plugin manifest declares it.
+                    "top_level": declared is not None or mount_dir.parent == root,
                     "logical_name": metadata["name"],
                     "mount_name": mount_dir.name,
                     "description": metadata["description"],
@@ -1382,6 +1572,7 @@ def merge_skills(
                 "source_role": source_role,
                 "mounts": mount_paths,
                 "runtimes": runtimes,
+                "loaded_runtimes": sorted({item["runtime"] for item in mounts if item["top_level"]}),
                 "mount_count": len(mount_paths),
                 "symlink_mounts": sum(1 for item in mounts if item["is_symlink"]),
                 "status": "archived" if scope["level"] == "archive" else "available",
@@ -1400,6 +1591,7 @@ def merge_skills(
         candidates = sorted(
             candidates,
             key=lambda item: (
+                preference_rank(item, config.get("skill_preferences", [])),
                 SCOPE_SCORE[item["scope"]["level"]],
                 item.get("source_priority", 0),
                 item["id"],
@@ -1487,14 +1679,20 @@ def instruction_inventory(
     return sorted(inventory, key=lambda item: item["path"])
 
 
-def read_skill_usage(state_path: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
-    """Read the skill invocation counters Claude Code keeps in ~/.claude.json."""
+def read_skill_usage(state_path: Optional[Path] = None) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Read the skill invocation counters Claude Code keeps in ~/.claude.json.
+
+    None when the file exists but cannot be read (Claude Code rewrites it
+    often): zeros would turn every skill into a candidate to switch off.
+    """
 
     path = state_path if state_path is not None else CLAUDE_STATE_PATH
     try:
         raw = read_json(path).get("skillUsage")
-    except (OSError, ValueError, json.JSONDecodeError):
+    except FileNotFoundError:
         return {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
     if not isinstance(raw, dict):
         return {}
     usage: Dict[str, Dict[str, Any]] = {}
@@ -1564,7 +1762,8 @@ def build_inventory() -> Dict[str, Any]:
     workflows = load_workflows()
     occurrences, broken = collect_skill_occurrences(config, projects)
     skills, collisions = merge_skills(occurrences, config, projects)
-    usage_summary = attach_skill_usage(skills, read_skill_usage())
+    usage = read_skill_usage()
+    usage_summary = attach_skill_usage(skills, usage or {})
     bundle_rules = config.get("skill_bundles", [])
     for skill in skills:
         skill["bundle"] = classify_bundle(skill, bundle_rules)
@@ -1593,6 +1792,7 @@ def build_inventory() -> Dict[str, Any]:
 
     return {
         "schema_version": "agent-brain.registry.v1",
+        "revision": INVENTORY_REVISION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "home": str(Path.home()),
         "registry": str(REGISTRY_DIR),
@@ -1602,6 +1802,8 @@ def build_inventory() -> Dict[str, Any]:
             "skill_scope_rules": config.get("skill_scope_rules", []),
             "active_plugins": config.get("active_plugins") or read_enabled_plugins(),
             "listing_limits": read_listing_limits(),
+            "skill_preferences": config.get("skill_preferences", []),
+            "skill_preference_headers": config.get("skill_preference_headers", ["Task", "Use", "Instead of"]),
         },
         "source_snapshot": source_snapshot(config, projects),
         "domains": domains,
@@ -1623,7 +1825,7 @@ def build_inventory() -> Dict[str, Any]:
             "project_count": len(projects),
             "domain_count": len(domains),
             "workflow_count": len(workflows),
-            "usage": usage_summary,
+            "usage": usage_summary if usage is not None else None,
         },
     }
 
@@ -1777,7 +1979,50 @@ def context_status(cwd: Path, inventory: Dict[str, Any], explicit_domain: Option
     }
 
 
+def applicable_preferences(preferences: Sequence[Dict[str, Any]], domain: str) -> List[Dict[str, Any]]:
+    return [
+        preference
+        for preference in preferences
+        if not any(domain_matches(excepted, domain) for excepted in preference.get("except_domains", []))
+    ]
+
+
+def preference_rank(skill: Dict[str, Any], preferences: Sequence[Dict[str, Any]]) -> int:
+    """1 for a configured pick, -1 for a copy configured to lose, 0 otherwise."""
+
+    name = listing_name(skill)
+    for preference in preferences:
+        if name == preference.get("use"):
+            return 1
+        if name in preference.get("instead_of", []):
+            return -1
+    return 0
+
+
+def preferred_instead(listed_name: str, preferences: Sequence[Dict[str, Any]]) -> Optional[str]:
+    return next(
+        (preference.get("use") for preference in preferences if listed_name in preference.get("instead_of", [])),
+        None,
+    )
+
+
+def preference_table(preferences: Sequence[Dict[str, Any]], headers: Sequence[str]) -> str:
+    def names(items: Sequence[str]) -> str:
+        return ", ".join(f"`{item}`" for item in items)
+
+    lines = ["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers)]
+    for preference in preferences:
+        use = names([preference["use"]]) + preference.get("use_note", "")
+        instead = names(preference.get("instead_of", [])) + preference.get("instead_of_note", "")
+        lines.append(f"| {preference['task']} | {use} | {instead} |")
+    return "\n".join(lines)
+
+
 def select_skill(query: str, status: Dict[str, Any], inventory: Dict[str, Any]) -> Dict[str, Any]:
+    preferences = applicable_preferences(
+        (inventory.get("config") or {}).get("skill_preferences", []),
+        (status.get("context") or {}).get("domain", ""),
+    )
     normalized = query.casefold()
     exact_candidates = [
         skill
@@ -1798,6 +2043,7 @@ def select_skill(query: str, status: Dict[str, Any], inventory: Dict[str, Any]) 
         candidates,
         key=lambda item: (
             item["id"] in active_ids,
+            preference_rank(item, preferences),
             SCOPE_SCORE[item["scope"]["level"]],
             item.get("source_priority", 0),
             item["mount_count"],
@@ -1810,12 +2056,14 @@ def select_skill(query: str, status: Dict[str, Any], inventory: Dict[str, Any]) 
     if exact_id and exact_id["scope"]["level"] != "archive":
         selected = exact_id
     elif selected:
+        selected_rank = preference_rank(selected, preferences)
         selected_score = SCOPE_SCORE[selected["scope"]["level"]]
         selected_priority = selected.get("source_priority", 0)
         equally_specific = [
             item
             for item in ranked
             if item["id"] in active_ids
+            and preference_rank(item, preferences) == selected_rank
             and SCOPE_SCORE[item["scope"]["level"]] == selected_score
             and item.get("source_priority", 0) == selected_priority
         ]
@@ -1824,6 +2072,8 @@ def select_skill(query: str, status: Dict[str, Any], inventory: Dict[str, Any]) 
     if selected:
         level = selected["scope"]["level"]
         reason = f"active {level} scope and canonical source priority"
+        if preference_rank(selected, preferences) > 0 and len(ranked) > 1:
+            reason = "configured skill preference"
         if normalized == selected["id"].casefold():
             reason = "explicit namespaced ID"
     elif exact_id and exact_id["scope"]["level"] == "archive":
@@ -1837,6 +2087,66 @@ def select_skill(query: str, status: Dict[str, Any], inventory: Dict[str, Any]) 
         "selected": selected,
         "candidates": ranked,
         "reason": reason,
+        "preferred_instead": preferred_instead(listing_name(selected), preferences) if selected else None,
+    }
+
+
+def user_hidden_names() -> set:
+    overrides = read_settings_file(CLAUDE_SETTINGS_PATH).get("skillOverrides")
+    if not isinstance(overrides, dict):
+        return set()
+    return {name for name, value in overrides.items() if value in ("off", "user-invocable-only")}
+
+
+def unused_report(inventory: Dict[str, Any], already_hidden: Iterable[str] = ()) -> Dict[str, List[Dict[str, Any]]]:
+    """Never-invoked skills the model is shown, split by what to do about them.
+
+    No domain: a candidate to turn off. A domain: keep it, the zero comes from
+    sessions that ran outside that domain. Plugin skills go per plugin, since
+    Claude Code turns a plugin off only as a whole.
+    """
+
+    running = set(inventory_config(inventory).get("active_plugins") or [])
+    hidden = set(already_hidden)
+    copies: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for skill in inventory["skills"]:
+        if skill["scope"]["level"] == "archive" or not skill.get("model_invocable", True):
+            continue
+        if "claude" not in skill.get("loaded_runtimes", skill["runtimes"]):
+            continue
+        plugin = skill.get("plugin_source") or skill["scope"].get("plugin")
+        if plugin and plugin not in running:
+            continue
+        copies[listing_name(skill)].append(skill)
+
+    turn_off: List[Dict[str, Any]] = []
+    in_domain: Dict[str, List[str]] = defaultdict(list)
+    plugins: Dict[str, Dict[str, Any]] = {}
+    for name, group in sorted(copies.items()):
+        unused = not any(skill["usage"]["count"] for skill in group)
+        domain = next((skill["scope"]["domain"] for skill in group if skill["scope"].get("domain")), None)
+        plugin = group[0].get("plugin_source") or group[0]["scope"].get("plugin")
+        if domain:
+            if unused:
+                in_domain[domain].append(name)
+        elif plugin:
+            entry = plugins.setdefault(plugin, {"plugin": plugin, "unused": [], "total": 0, "command": None})
+            entry["total"] += 1
+            if unused:
+                entry["unused"].append(name)
+        elif unused and name not in hidden:
+            turn_off.append({"name": name, "id": group[0]["id"], "command": f"brain skill off {name} --settings user"})
+
+    for entry in plugins.values():
+        if entry["unused"] and len(entry["unused"]) == entry["total"]:
+            entry["command"] = f"claude plugin disable {entry['plugin']}"
+    return {
+        "turn_off": turn_off,
+        "plugins": [entry for _, entry in sorted(plugins.items()) if entry["unused"]],
+        "in_domain": [
+            {"domain": domain, "names": names, "command": f"brain use {domain} --dry-run"}
+            for domain, names in sorted(in_domain.items())
+        ],
     }
 
 
@@ -1876,7 +2186,7 @@ def generate_audit(inventory: Dict[str, Any]) -> str:
             skill for skill in inventory["skills"]
             if skill["scope"]["level"] != "archive"
             and skill.get("model_invocable", True)
-            and "claude" in skill["runtimes"]
+            and "claude" in skill.get("loaded_runtimes", skill["runtimes"])
             and (skill.get("plugin_source") or skill["scope"].get("plugin") or None) in running_plugins | {None}
         ]
         cap = (config.get("listing_limits") or {}).get("max_desc_chars")
@@ -1897,6 +2207,32 @@ def generate_audit(inventory: Dict[str, Any]) -> str:
                 f"- Total invocations: **{usage['total_invocations']}**",
                 f"- Listed to the model: **{len(listed)}** skills, about **{listing_cost(listed)}** tokens per session",
                 f"- Of those never invoked: about **{listing_cost([item for item in listed if not item['usage']['count']])}** tokens",
+                "",
+            ]
+        )
+        unused = unused_report(inventory, user_hidden_names())
+        lines.extend(
+            [
+                "## Never invoked: what to do",
+                "",
+                f"### No domain — candidates to turn off ({len(unused['turn_off'])})",
+                "",
+                *(f"- `{item['name']}` — `{item['command']}`" for item in unused["turn_off"]),
+                "",
+                f"### Plugin skills — Claude Code turns off only a whole plugin ({len(unused['plugins'])} plugins)",
+                "",
+                *(
+                    f"- `{item['plugin']}`: {len(item['unused'])} of {item['total']} never invoked — "
+                    + (f"`{item['command']}`" if item["command"] else "keep, some are in use")
+                    for item in unused["plugins"]
+                ),
+                "",
+                "### In a domain — keep: the zero comes from sessions outside the domain",
+                "",
+                *(
+                    f"- `{item['domain']}` ({len(item['names'])}): {', '.join(item['names'])} — `{item['command']}`"
+                    for item in unused["in_domain"]
+                ),
                 "",
             ]
         )
@@ -2221,7 +2557,7 @@ def load_or_build_inventory() -> Dict[str, Any]:
     if DATA_PATH.is_file():
         try:
             inventory = read_json(DATA_PATH)
-            if inventory.get("source_snapshot") == source_snapshot():
+            if inventory.get("revision") == INVENTORY_REVISION and inventory.get("source_snapshot") == source_snapshot():
                 return inventory
         except (OSError, ValueError, json.JSONDecodeError):
             pass
@@ -2258,6 +2594,10 @@ def validation_report(inventory: Dict[str, Any]) -> Dict[str, List[str]]:
             errors.append(f"config skill scope rule references unknown domain {rule.get('domain')}")
         if rule.get("level") == "project" and rule.get("project") not in project_ids:
             errors.append(f"config skill scope rule references unknown project {rule.get('project')}")
+    for index, preference in enumerate(config.get("skill_preferences", [])):
+        if not (isinstance(preference.get("task"), str) and isinstance(preference.get("use"), str)
+                and isinstance(preference.get("instead_of"), list)):
+            errors.append(f"skill_preferences[{index}] needs task, use and an instead_of list")
     for domain in inventory["domains"]:
         if domain.get("parent") and domain["parent"] not in domain_ids:
             errors.append(f"domain {domain['id']} references unknown parent {domain['parent']}")
@@ -2740,10 +3080,17 @@ def command_domain_delete(args: argparse.Namespace) -> int:
 
 def command_skill_scope(args: argparse.Namespace) -> int:
     inventory = build_inventory()
-    skill = next((item for item in inventory["skills"] if item["id"] == args.id), None)
-    if skill is None:
+    matches = [item for item in inventory["skills"] if item["id"] == args.id]
+    if not matches:
+        # Archiving renames the ID; the listed name is what the user still sees.
+        matches = [item for item in inventory["skills"] if listing_name(item) == args.id]
+    if len(matches) > 1:
+        print(f"Several skills are listed as {args.id}; pass one ID: " + ", ".join(item["id"] for item in matches), file=sys.stderr)
+        return 2
+    if not matches:
         print(f"Unknown skill: {args.id}", file=sys.stderr)
         return 2
+    skill = matches[0]
     if args.level == "domain" and args.domain not in {item["id"] for item in inventory["domains"]}:
         print(f"Unknown domain: {args.domain}", file=sys.stderr)
         return 2
@@ -2796,6 +3143,8 @@ def command_inspect(args: argparse.Namespace) -> int:
     print(f"Folder: {harness['root']}")
     print(f"Domain: {context['domain']} (source: {context['source']})"
           + (f", project: {project['id']}" if project else ""))
+    for warning in harness["warnings"]:
+        print(f"Warning: {warning}")
     print()
     print("Settings files:")
     for item in harness["settings_files"]:
@@ -2935,6 +3284,8 @@ def command_explain(args: argparse.Namespace) -> int:
         print(f"Selected: {selected['id']}")
         print(f"Reason:   {result['reason']}")
         print(f"Source:   {selected['source_path']}")
+        if result["preferred_instead"]:
+            print(f"Prefer:   {result['preferred_instead']} (skill_preferences in config/brain.json)")
     else:
         print(f"Selected: none")
         print(f"Reason:   {result['reason']}")
@@ -2944,6 +3295,47 @@ def command_explain(args: argparse.Namespace) -> int:
         marker = "active" if candidate["id"] in active_ids else "excluded"
         print(f"  - {candidate['id']} [{marker}] -> {candidate['source_path']}")
     return 0 if result["selected"] else 2
+
+
+def command_prefs(args: argparse.Namespace) -> int:
+    inventory = load_or_build_inventory()
+    if args.domain and args.domain not in {item["id"] for item in inventory["domains"]}:
+        print(f"Unknown domain: {args.domain}", file=sys.stderr)
+        return 2
+    config = inventory_config(inventory)
+    preferences = config.get("skill_preferences", [])
+    if args.json:
+        domain = resolve_context(Path(args.cwd), inventory, explicit_domain=args.domain)["domain"]
+        applying = applicable_preferences(preferences, domain)
+        rows = [dict(preference, applies=preference in applying) for preference in preferences]
+        print(json.dumps({"domain": domain, "preferences": rows}, ensure_ascii=False, indent=2))
+        return 0
+    if not preferences:
+        print("No skill preferences yet: add skill_preferences to config/brain.json.")
+        return 0
+    print(preference_table(preferences, config["skill_preference_headers"]))
+    return 0
+
+
+def command_unused(args: argparse.Namespace) -> int:
+    inventory = load_or_build_inventory()
+    if not inventory["stats"].get("usage"):
+        print("Skill call counters were unreadable at the last build (~/.claude.json); run brain build again.", file=sys.stderr)
+        return 2
+    report = unused_report(inventory, user_hidden_names())
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    print(f"No domain, never invoked — candidates to turn off ({len(report['turn_off'])}):")
+    for item in report["turn_off"]:
+        print(f"  {item['name']}: {item['command']}")
+    print(f"Plugins with never-invoked skills ({len(report['plugins'])}):")
+    for item in report["plugins"]:
+        print(f"  {item['plugin']}: {len(item['unused'])} of {item['total']}" + (f", {item['command']}" if item["command"] else ""))
+    print("In a domain, never invoked — keep:")
+    for item in report["in_domain"]:
+        print(f"  {item['domain']}: {len(item['names'])}, check with {item['command']}")
+    return 0
 
 
 def command_validate(_: argparse.Namespace) -> int:
@@ -2996,24 +3388,80 @@ def command_validate(_: argparse.Namespace) -> int:
     return 0
 
 
-def report_listing_overrides(inventory: Dict[str, Any], overrides: Dict[str, str], applied: bool) -> None:
-    limits = inventory_config(inventory).get("listing_limits") or {}
-    cap = limits.get("max_desc_chars")
-    hidden = [skill for skill in inventory["skills"] if listing_name(skill) in overrides]
+def listing_tokens(inventory: Dict[str, Any], names: Iterable[str]) -> int:
+    """Rough token cost of these listed names in the skill listing."""
+
+    wanted = set(names)
+    cap = (inventory_config(inventory).get("listing_limits") or {}).get("max_desc_chars")
+    hidden = [skill for skill in inventory["skills"] if listing_name(skill) in wanted]
     chars = sum(min(len(skill["description"]), cap or len(skill["description"])) + len(skill["name"]) + 12 for skill in hidden)
+    return round(chars / 3)
+
+
+def report_listing_overrides(
+    inventory: Dict[str, Any], overrides: Dict[str, str], applied: bool, unhideable: Sequence[str]
+) -> None:
     verb = "Hidden from the model" if applied else "Would hide"
-    print(f"{verb}: {len(overrides)} skills, about {round(chars / 3)} tokens per session. They stay available as /name.")
+    print(
+        f"{verb}: {len(overrides)} skills, about {listing_tokens(inventory, overrides)} tokens per session. "
+        "They stay available as /name."
+    )
+    if unhideable:
+        print(
+            f"Cannot hide {len(unhideable)} plugin skills: Claude Code ignores skillOverrides for plugin skills, "
+            "only the whole plugin can be turned off."
+        )
+
+
+def profile_settings_path(level: str, cwd: Path) -> Path:
+    return CLAUDE_SETTINGS_PATH if level == "user" else safe_resolve(cwd) / ".claude" / "settings.local.json"
+
+
+def unrecorded_hidden(target: Path, recorded: Iterable[str], keep: Iterable[str] = ()) -> List[str]:
+    """Hidden entries in ``target`` brain has no record of writing: a /skills
+    menu choice, a hand edit, or an older brain. They are never removed."""
+
+    overrides = read_settings_file(target).get("skillOverrides")
+    if not isinstance(overrides, dict):
+        return []
+    skip = set(recorded) | set(keep)
+    return sorted(name for name, value in overrides.items() if value == "user-invocable-only" and name not in skip)
+
+
+def report_unrecorded(names: Sequence[str]) -> None:
+    if names:
+        sample = ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")
+        print(f"{len(names)} hidden entries brain has no record of writing stay: {sample}")
 
 
 def command_use(args: argparse.Namespace) -> int:
+    target = profile_settings_path(args.settings, Path(args.cwd))
+    try:
+        previous = read_profiles().get(str(safe_resolve(target)), {}).get("hidden", [])
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
     if args.domain == "auto":
-        if STATE_PATH.exists():
-            STATE_PATH.unlink()
-        print("Explicit domain override cleared; context will be resolved automatically.")
-        if args.skip_overrides or args.dry_run:
+        unrecorded = unrecorded_hidden(target, previous)
+        if args.dry_run:
+            print(f"Would make visible again {len(previous)} skills brain hid in {target}.")
+            report_unrecorded(unrecorded)
             return 0
-        write_skill_overrides({})
-        print("Skill listing restored: every skill is visible to the model again.")
+        if args.settings == "user":
+            if STATE_PATH.exists():
+                STATE_PATH.unlink()
+            print("Explicit domain override cleared; context will be resolved automatically.")
+        if args.skip_overrides:
+            return 0
+        try:
+            if previous:
+                write_skill_overrides({}, target, previous=previous)
+            forget_profile(target)
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return 2
+        print(f"Profile removed from {target}: {len(previous)} skills brain had hidden are visible to the model again.")
+        report_unrecorded(unrecorded)
         return 0
     domain_ids = {item["id"] for item in load_domains()}
     if args.domain not in domain_ids:
@@ -3022,26 +3470,73 @@ def command_use(args: argparse.Namespace) -> int:
         return 2
 
     inventory = load_or_build_inventory()
-    overrides = skill_listing_overrides(inventory, resolve_context(Path(args.cwd), inventory, explicit_domain=args.domain))
+    try:
+        context = profile_context(Path(args.cwd), inventory, args.domain, args.settings)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    overrides = skill_listing_overrides(inventory, context)
+    unhideable = unhideable_plugin_skills(inventory, context)
+    unrecorded = unrecorded_hidden(target, previous, keep=overrides)
     if args.dry_run:
-        report_listing_overrides(inventory, overrides, applied=False)
+        if args.json:
+            payload = {
+                "domain": args.domain,
+                "settings_path": str(target),
+                "hide": sorted(overrides),
+                "tokens": listing_tokens(inventory, overrides),
+                "unhideable_plugin_skills": unhideable,
+                "unrecorded_hidden": unrecorded,
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+        report_listing_overrides(inventory, overrides, applied=False, unhideable=unhideable)
+        report_unrecorded(unrecorded)
         for name in sorted(overrides):
             print(f"  {name}")
         return 0
 
-    write_json(
-        STATE_PATH,
-        {
-            "schema_version": "agent-brain.active-context.v1",
-            "domain": args.domain,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
-    print(f"Default domain override set to {args.domain}.")
+    if args.settings == "user":
+        write_json(
+            STATE_PATH,
+            {
+                "schema_version": "agent-brain.active-context.v1",
+                "domain": args.domain,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        print(f"Default domain override set to {args.domain}.")
     if args.skip_overrides:
         return 0
-    write_skill_overrides(overrides)
-    report_listing_overrides(inventory, overrides, applied=True)
+    try:
+        write_skill_overrides(overrides, target, previous=previous)
+        record_profile(target, args.domain, Path(args.cwd), sorted(overrides))
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    report_listing_overrides(inventory, overrides, applied=True, unhideable=unhideable)
+    report_unrecorded(unrecorded)
+    return 0
+
+
+def command_profile(args: argparse.Namespace) -> int:
+    try:
+        status = profile_status(Path(args.cwd), load_or_build_inventory())
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return 0
+    if not status["stale"]:
+        return 0
+    parts = []
+    if status["missing"]:
+        sample = ", ".join(status["missing"][:3]) + (", ..." if len(status["missing"]) > 3 else "")
+        parts.append(f"{len(status['missing'])} skills visible outside the domain ({sample})")
+    if status["wrongly_hidden"]:
+        parts.append(f"{len(status['wrongly_hidden'])} hidden but now in scope")
+    print(f"Agent Brain profile {status['applied']['domain']} is stale: {'; '.join(parts)}. Refresh: {status['command']}")
     return 0
 
 
@@ -3110,7 +3605,10 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--registry",
         default=os.environ.get("AGENT_BRAIN_HOME", str(DEFAULT_REGISTRY_DIR)),
-        help="registry directory (default: ~/.agent-brain or AGENT_BRAIN_HOME)",
+        help=(
+            f"registry directory (default: {DEFAULT_REGISTRY_DIR}, the engine folder when it holds "
+            "config/brain.json, else ~/.agent-brain; AGENT_BRAIN_HOME overrides it)"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -3240,6 +3738,16 @@ def create_parser() -> argparse.ArgumentParser:
     explain_parser.add_argument("--json", action="store_true")
     explain_parser.set_defaults(func=command_explain)
 
+    prefs_parser = subparsers.add_parser("prefs", help="print which copy to take when skills do the same job")
+    prefs_parser.add_argument("--cwd", default=os.getcwd())
+    prefs_parser.add_argument("--domain")
+    prefs_parser.add_argument("--json", action="store_true", help="rows with whether each applies in this context")
+    prefs_parser.set_defaults(func=command_prefs)
+
+    unused_parser = subparsers.add_parser("unused", help="never-invoked skills: what to turn off and what to keep")
+    unused_parser.add_argument("--json", action="store_true")
+    unused_parser.set_defaults(func=command_unused)
+
     validate_parser = subparsers.add_parser("validate", help="validate registry and generated outputs")
     validate_parser.add_argument("--json", action="store_true")
     validate_parser.set_defaults(func=command_validate)
@@ -3248,8 +3756,20 @@ def create_parser() -> argparse.ArgumentParser:
     use_parser.add_argument("domain", help="domain ID or 'auto'")
     use_parser.add_argument("--cwd", default=str(Path.cwd()), help="workspace path used to resolve the project")
     use_parser.add_argument("--dry-run", action="store_true", help="list what would be hidden, change nothing")
+    use_parser.add_argument("--json", action="store_true", help="with --dry-run: print the plan as JSON")
+    use_parser.add_argument(
+        "--settings",
+        choices=["user", "local"],
+        default="user",
+        help="user: ~/.claude/settings.json, every session; local: the --cwd folder's settings.local.json, sessions started there",
+    )
     use_parser.add_argument("--skip-overrides", action="store_true", help="switch domain without touching runtime settings")
     use_parser.set_defaults(func=command_use)
+
+    profile_parser = subparsers.add_parser("profile", help="say whether the profile applied in a folder is stale")
+    profile_parser.add_argument("--cwd", default=os.getcwd())
+    profile_parser.add_argument("--json", action="store_true")
+    profile_parser.set_defaults(func=command_profile)
 
     hook_parser = subparsers.add_parser("hook", help="emit UserPromptSubmit context")
     hook_parser.add_argument("--runtime", choices=["codex", "claude"], required=True)

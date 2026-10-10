@@ -555,14 +555,17 @@ class ListingOverrideTests(unittest.TestCase):
     """Turning registry scope into skillOverrides the runtime understands."""
 
     def skill(self, name, level, **scope):
-        return {
+        skill = {
             "id": f"{level}.{name}",
             "name": name,
             "description": "d",
             "runtimes": scope.pop("runtimes", ["claude"]),
             "model_invocable": scope.pop("model_invocable", True),
-            "scope": {"level": level, "domain": None, "project": None, "plugin": None, **scope},
         }
+        if "loaded_runtimes" in scope:
+            skill["loaded_runtimes"] = scope.pop("loaded_runtimes")
+        skill["scope"] = {"level": level, "domain": None, "project": None, "plugin": None, **scope}
+        return skill
 
     def overrides(self, skills, context):
         return brain.skill_listing_overrides({"skills": skills}, context)
@@ -585,11 +588,33 @@ class ListingOverrideTests(unittest.TestCase):
         context = {"domain": "personal", "project": None}
         self.assertEqual(self.overrides(skills, context), {})
 
-    def test_plugin_skill_moved_into_a_domain_keeps_its_prefix(self):
+    def test_plugin_skill_outside_context_is_reported_not_written(self):
+        # Claude Code ignores skillOverrides for plugin skills, so a key for one is dead weight.
         skill = self.skill("babysit", "domain", domain="work.company")
         skill["plugin_source"] = "claude-mem"
         context = {"domain": "personal", "project": None, "active_plugins": ["claude-mem"]}
-        self.assertEqual(self.overrides([skill], context), {"claude-mem:babysit": "user-invocable-only"})
+        self.assertEqual(self.overrides([skill], context), {})
+        self.assertEqual(brain.unhideable_plugin_skills({"skills": [skill]}, context), ["claude-mem:babysit"])
+
+    def test_archived_name_without_an_active_copy_is_hidden(self):
+        context = {"domain": "personal", "project": None}
+        self.assertEqual(self.overrides([self.skill("old", "archive")], context), {"old": "user-invocable-only"})
+
+    def test_archived_name_with_an_active_copy_stays_visible(self):
+        skills = [self.skill("review", "archive"), self.skill("review", "global")]
+        context = {"domain": "personal", "project": None}
+        self.assertEqual(self.overrides(skills, context), {})
+
+    def test_archived_plugin_copy_is_reported_as_unhideable(self):
+        skill = dict(self.skill("tdd", "archive"), plugin_source="superpowers")
+        context = {"domain": "personal", "project": None, "active_plugins": ["superpowers"]}
+        self.assertEqual(self.overrides([skill], context), {})
+        self.assertEqual(brain.unhideable_plugin_skills({"skills": [skill]}, context), ["superpowers:tdd"])
+
+    def test_copy_claude_code_does_not_load_is_left_alone(self):
+        snapshot = self.skill("typings", "archive", loaded_runtimes=[])
+        context = {"domain": "personal", "project": None}
+        self.assertEqual(self.overrides([snapshot], context), {})
 
     def test_plugin_scoped_skill_is_never_hidden_while_its_plugin_runs(self):
         skills = [self.skill("babysit", "plugin", plugin="claude-mem")]
@@ -601,9 +626,8 @@ class ListingOverrideTests(unittest.TestCase):
         context = {"domain": "personal", "project": None, "active_plugins": ["superpowers"]}
         self.assertEqual(self.overrides(skills, context), {})
 
-    def test_archived_and_non_claude_skills_are_ignored(self):
+    def test_non_claude_and_disabled_plugin_skills_are_ignored(self):
         skills = [
-            self.skill("old", "archive"),
             self.skill("codex-only", "domain", domain="work.company", runtimes=["codex"]),
             self.skill("hidden", "domain", domain="work.company", model_invocable=False),
             self.skill("off-plugin", "plugin", plugin="ponytail"),
@@ -619,7 +643,7 @@ class ListingOverrideTests(unittest.TestCase):
                 json.dumps({"model": "opus", "skillOverrides": {"manual": "off", "stale": "user-invocable-only"}}),
                 encoding="utf-8",
             )
-            brain.write_skill_overrides({"fresh": "user-invocable-only"}, path)
+            brain.write_skill_overrides({"fresh": "user-invocable-only"}, path, previous={"stale"})
             written = json.loads(path.read_text(encoding="utf-8"))
             backup = json.loads((path.parent / "settings.json.brain-backup").read_text(encoding="utf-8"))
         self.assertEqual(written["model"], "opus")
@@ -641,7 +665,7 @@ class ListingOverrideTests(unittest.TestCase):
                 json.dumps({"model": "opus", "skillOverrides": {"manual": "off", "stale": "user-invocable-only"}}),
                 encoding="utf-8",
             )
-            brain.write_skill_overrides({}, path)
+            brain.write_skill_overrides({}, path, previous={"stale"})
             written = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(written["skillOverrides"], {"manual": "off"})
         self.assertEqual(written["model"], "opus")
@@ -650,10 +674,27 @@ class ListingOverrideTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"
             path.write_text(json.dumps({"model": "opus", "skillOverrides": {"stale": "user-invocable-only"}}), encoding="utf-8")
-            brain.write_skill_overrides({}, path)
+            brain.write_skill_overrides({}, path, previous={"stale"})
             written = json.loads(path.read_text(encoding="utf-8"))
         self.assertNotIn("skillOverrides", written)
         self.assertEqual(written["model"], "opus")
+
+    def test_unreadable_settings_file_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.local.json"
+            path.write_text('{"permissions": {"allow": []}, oops', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Cannot parse"):
+                brain.write_skill_overrides({"fresh": "user-invocable-only"}, path)
+            self.assertEqual(path.read_text(encoding="utf-8"), '{"permissions": {"allow": []}, oops')
+
+    def test_hidden_entry_brain_did_not_write_survives(self):
+        # The /skills menu writes the same value; brain removes only what it wrote itself.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.local.json"
+            path.write_text(json.dumps({"skillOverrides": {"menu-choice": "user-invocable-only"}}), encoding="utf-8")
+            brain.write_skill_overrides({"fresh": "user-invocable-only"}, path)
+            written = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(written["skillOverrides"], {"fresh": "user-invocable-only", "menu-choice": "user-invocable-only"})
 
     def test_missing_settings_file_is_created(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -756,6 +797,29 @@ class UsageReportTests(unittest.TestCase):
         self.assertIn("Idle over 30 days: **1**", report)
         self.assertIn("Total invocations: **12**", report)
 
+    def test_audit_splits_never_invoked_into_turn_off_and_keep(self):
+        def skill(name, domain=None):
+            return {
+                "id": name, "name": name, "description": "d", "runtimes": ["claude"], "model_invocable": True,
+                "scope": {"level": "domain" if domain else "global", "domain": domain, "project": None, "plugin": None},
+                "usage": {"count": 0},
+            }
+
+        inventory = {
+            "generated_at": "2026-10-10T00:00:00+00:00",
+            "instructions": [], "collisions": [], "broken_sources": [], "projects": [], "domains": [],
+            "skills": [skill("draft"), skill("ququ-solve", domain="work")],
+            "config": {},
+            "stats": {
+                "skill_sources": 2, "skill_mounts": 2, "domain_count": 1, "project_count": 0,
+                "workflow_count": 0, "collision_count": 0, "unresolved_collision_count": 0, "broken_count": 0,
+                "usage": {"tracked": 2, "used": 0, "never_used": 2, "idle_over_30d": 0, "total_invocations": 0},
+            },
+        }
+        report = brain.generate_audit(inventory)
+        self.assertIn("- `draft` — `brain skill off draft --settings user`", report)
+        self.assertIn("- `work` (1): ququ-solve — `brain use work --dry-run`", report)
+
     def test_audit_lists_blocks_when_the_registry_has_them(self):
         inventory = {
             "generated_at": "2026-08-19T00:00:00+00:00",
@@ -824,6 +888,12 @@ class SkillUsageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             usage = brain.read_skill_usage(Path(directory) / "absent.json")
         self.assertEqual(usage, {})
+
+    def test_unreadable_state_file_yields_no_usage_rather_than_zeros(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "claude.json"
+            path.write_text('{"skillUsage": {"review": {"usageCount": 2', encoding="utf-8")
+            self.assertIsNone(brain.read_skill_usage(path))
 
     def test_entry_without_timestamp_keeps_count(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -909,6 +979,305 @@ class SkillUsageTests(unittest.TestCase):
         summary = brain.attach_skill_usage(skills, {"kept": {"count": 5, "last_used": "2026-08-18"}}, today="2026-08-19")
         self.assertEqual(summary["tracked"], 0)
         self.assertEqual(skills[0]["usage"]["count"], 5)
+
+
+class RuntimeLoadingTests(unittest.TestCase):
+    """Claude Code reads a skill folder only at the top of a skill root."""
+
+    def write_skill(self, folder, name):
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: d\n---\n", encoding="utf-8")
+
+    def test_nested_snapshot_is_not_loaded_but_top_level_skill_is(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "skills"
+            self.write_skill(root / "review", "review")
+            self.write_skill(root / "review-workspace" / "skill-snapshots" / "typings", "typings")
+            config = {"skill_roots": [{"path": str(root), "runtime": "claude", "kind": "mount"}]}
+            occurrences, _ = brain.collect_skill_occurrences(config, [])
+            skills, _ = brain.merge_skills(occurrences, config, [])
+        loaded = {skill["name"]: skill["loaded_runtimes"] for skill in skills}
+        self.assertEqual(loaded, {"review": ["claude"], "typings": []})
+
+
+class SkillPreferenceTests(unittest.TestCase):
+    """Which copy to take when several skills do the same job."""
+
+    PREFERENCES = [
+        {
+            "task": "Баг, красный тест",
+            "use": "systematic-debugging",
+            "instead_of": ["superpowers:systematic-debugging", "mattpocock-skills:diagnosing-bugs"],
+            "except_domains": ["personal.software"],
+        },
+        {
+            "task": "Ревью PR в Аркадии",
+            "use": "arcanum-review",
+            "use_note": ", при высокой цене ошибки плюс `pr-council`",
+            "instead_of": ["mattpocock-skills:code-review"],
+            "instead_of_note": ", агент `code-reviewer`",
+        },
+        {
+            "task": "Нянчить PR до мержа",
+            "use": "babysit-arcanum-pr",
+            "instead_of": ["claude-mem:babysit"],
+            "instead_of_note": " — он про GitHub",
+        },
+    ]
+
+    def skill(self, name, plugin=None):
+        level = "plugin" if plugin else "global"
+        return {
+            "id": f"{level}.{plugin + '.' if plugin else ''}{name}",
+            "name": name,
+            "plugin_source": plugin,
+            "scope": {"level": level, "domain": None, "project": None, "plugin": plugin},
+            "source_path": f"/skills/{plugin or 'personal'}/{name}",
+            "mount_count": 1,
+        }
+
+    def inventory(self, skills):
+        return {
+            "generated_at": "2026-10-10T00:00:00+00:00",
+            "projects": [],
+            "workflows": [],
+            "collisions": [],
+            "skills": skills,
+            "config": {
+                "default_domain": "work",
+                "domain_path_rules": [],
+                "active_plugins": ["superpowers", "mattpocock-skills"],
+                "skill_preferences": self.PREFERENCES,
+            },
+        }
+
+    def explain(self, query, skills, domain):
+        inventory = self.inventory(skills)
+        status = brain.context_status(Path("/tmp/brain-preferences"), inventory, explicit_domain=domain)
+        return brain.select_skill(query, status, inventory)
+
+    def test_markdown_table_matches_the_routing_rule(self):
+        self.assertEqual(
+            brain.preference_table(self.PREFERENCES, ["Задача", "Беру", "Не беру следом"]),
+            "\n".join(
+                [
+                    "| Задача | Беру | Не беру следом |",
+                    "|---|---|---|",
+                    "| Баг, красный тест | `systematic-debugging` | `superpowers:systematic-debugging`, `mattpocock-skills:diagnosing-bugs` |",
+                    "| Ревью PR в Аркадии | `arcanum-review`, при высокой цене ошибки плюс `pr-council` | `mattpocock-skills:code-review`, агент `code-reviewer` |",
+                    "| Нянчить PR до мержа | `babysit-arcanum-pr` | `claude-mem:babysit` — он про GitHub |",
+                ]
+            ),
+        )
+
+    def test_personal_copy_beats_the_plugin_copy_of_the_same_name(self):
+        skills = [self.skill("systematic-debugging"), self.skill("systematic-debugging", plugin="superpowers")]
+        result = self.explain("systematic-debugging", skills, "work")
+        self.assertEqual(result["selected"]["id"], "global.systematic-debugging")
+
+    def test_preference_is_off_in_its_excepted_domain(self):
+        skills = [self.skill("systematic-debugging"), self.skill("systematic-debugging", plugin="superpowers")]
+        result = self.explain("systematic-debugging", skills, "personal.software")
+        self.assertEqual(result["selected"]["id"], "plugin.superpowers.systematic-debugging")
+
+    def test_explain_points_from_a_differently_named_copy_to_the_preferred_one(self):
+        skills = [self.skill("systematic-debugging"), self.skill("diagnosing-bugs", plugin="mattpocock-skills")]
+        result = self.explain("diagnosing-bugs", skills, "work")
+        self.assertEqual(result["preferred_instead"], "systematic-debugging")
+
+    def test_preference_without_use_does_not_crash_ranking(self):
+        broken = [{"task": "x", "instead_of": ["superpowers:systematic-debugging"]}]
+        self.assertEqual(brain.preference_rank(self.skill("systematic-debugging"), broken), 0)
+
+    def test_collision_report_prefers_the_configured_copy(self):
+        occurrences = []
+        for plugin in (None, "superpowers"):
+            skill = self.skill("systematic-debugging", plugin=plugin)
+            occurrences.append(
+                {
+                    "top_level": True,
+                    "logical_name": skill["name"],
+                    "mount_name": skill["name"],
+                    "description": "d",
+                    "model_invocable": True,
+                    "plugin_source": plugin,
+                    "mount_path": skill["source_path"],
+                    "source_path": skill["source_path"],
+                    "package_fingerprint": skill["source_path"],
+                    "scope": skill["scope"],
+                    "skill_file": skill["source_path"] + "/SKILL.md",
+                    "runtime": "claude",
+                    "root_kind": "mount",
+                    "is_symlink": False,
+                }
+            )
+        _, collisions = brain.merge_skills(occurrences, {"skill_preferences": self.PREFERENCES}, [])
+        self.assertEqual(collisions[0]["preferred_id"], "global.systematic-debugging")
+
+
+class ProfileStalenessTests(unittest.TestCase):
+    """A profile goes stale when skills change after brain use wrote it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "home"
+        self.folder = self.home / "notes"
+        self.folder.mkdir(parents=True)
+        self.local = self.folder / ".claude" / "settings.local.json"
+        patcher = mock.patch.object(brain, "PROFILES_PATH", Path(self.tmp.name) / "state" / "profiles.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def skill(self, name, domain=None):
+        return {
+            "id": f"{'domain.' + domain if domain else 'global'}.{name}",
+            "name": name,
+            "description": "d",
+            "runtimes": ["claude"],
+            "scope": {"level": "domain" if domain else "global", "domain": domain, "project": None, "plugin": None},
+        }
+
+    def inventory(self, skills):
+        return {
+            "projects": [],
+            "skills": skills,
+            "config": {"default_domain": "personal", "domain_path_rules": [], "active_plugins": []},
+        }
+
+    def apply(self, skills):
+        inventory = self.inventory(skills)
+        context = brain.resolve_context(self.folder, inventory, explicit_domain="personal")
+        overrides = brain.skill_listing_overrides(inventory, context)
+        brain.write_skill_overrides(overrides, self.local)
+        brain.record_profile(self.local, "personal", self.folder, sorted(overrides))
+
+    def status(self, skills):
+        return brain.profile_status(self.folder, self.inventory(skills), home=self.home)
+
+    def test_folder_without_a_profile_is_not_stale(self):
+        status = self.status([self.skill("deploy", "work")])
+        self.assertIsNone(status["applied"])
+        self.assertFalse(status["stale"])
+        self.assertEqual(status["domain"], "personal")
+
+    def test_fresh_profile_is_not_stale(self):
+        skills = [self.skill("deploy", "work")]
+        self.apply(skills)
+        status = self.status(skills)
+        self.assertEqual(status["applied"]["domain"], "personal")
+        self.assertFalse(status["stale"])
+
+    def test_skill_installed_after_apply_makes_the_profile_stale(self):
+        self.apply([self.skill("deploy", "work")])
+        status = self.status([self.skill("deploy", "work"), self.skill("release", "work")])
+        self.assertTrue(status["stale"])
+        self.assertEqual(status["missing"], ["release"])
+
+    def test_manual_on_is_not_reported_as_stale(self):
+        self.apply([self.skill("deploy", "work")])
+        brain.write_skill_overrides({"release": "on"}, self.local)
+        status = self.status([self.skill("deploy", "work"), self.skill("release", "work")])
+        self.assertFalse(status["stale"])
+
+    def test_folder_profile_keeps_the_folders_own_project_skills(self):
+        inventory = self.inventory([self.skill("deploy", "work"), dict(self.skill("cart"), scope={
+            "level": "project", "domain": "personal", "project": "shop", "plugin": None})])
+        inventory["projects"] = [{"id": "shop", "path": str(self.folder), "domain": "personal"}]
+        context = brain.profile_context(self.folder, inventory, "personal", "local")
+        self.assertEqual(brain.skill_listing_overrides(inventory, context), {"deploy": "user-invocable-only"})
+
+    def test_folder_profile_must_use_the_folders_own_domain(self):
+        with self.assertRaisesRegex(ValueError, "resolves to personal"):
+            brain.profile_context(self.folder, self.inventory([]), "work", "local")
+
+    def test_corrupt_profile_record_is_an_error_not_an_empty_one(self):
+        brain.PROFILES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        brain.PROFILES_PATH.write_text("{not json", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "profiles.json"):
+            brain.read_profiles()
+
+    def test_skill_moved_out_of_its_domain_is_reported_as_wrongly_hidden(self):
+        self.apply([self.skill("deploy", "work")])
+        status = self.status([self.skill("deploy")])
+        self.assertTrue(status["stale"])
+        self.assertEqual(status["wrongly_hidden"], ["deploy"])
+
+
+class UnusedReportTests(unittest.TestCase):
+    """Never-invoked skills split as skills-routing.md asks: no domain vs a domain."""
+
+    def skill(self, name, count=0, domain=None, plugin=None, level=None):
+        return {
+            "id": name,
+            "name": name,
+            "description": "d",
+            "runtimes": ["claude"],
+            "model_invocable": True,
+            "plugin_source": plugin,
+            "scope": {
+                "level": level or ("domain" if domain else "plugin" if plugin else "global"),
+                "domain": domain,
+                "project": None,
+                "plugin": plugin,
+            },
+            "usage": {"count": count},
+        }
+
+    def report(self, skills):
+        return brain.unused_report({"skills": skills, "config": {"active_plugins": ["claude-mem", "jev"]}})
+
+    def test_global_skill_without_calls_is_a_candidate_to_turn_off(self):
+        report = self.report([self.skill("draft"), self.skill("busy", count=3)])
+        self.assertEqual(report["turn_off"], [{"name": "draft", "id": "draft", "command": "brain skill off draft --settings user"}])
+
+    def test_domain_skill_without_calls_is_kept_and_grouped_by_domain(self):
+        report = self.report([self.skill("ququ-solve", domain="work"), self.skill("ququ-test", domain="work")])
+        self.assertEqual(report["turn_off"], [])
+        self.assertEqual(
+            report["in_domain"],
+            [{"domain": "work", "names": ["ququ-solve", "ququ-test"], "command": "brain use work --dry-run"}],
+        )
+
+    def test_plugin_skills_are_reported_per_plugin(self):
+        report = self.report(
+            [self.skill("a", plugin="claude-mem"), self.skill("b", count=1, plugin="claude-mem"), self.skill("x", plugin="jev")]
+        )
+        self.assertEqual(
+            report["plugins"],
+            [
+                {"plugin": "claude-mem", "unused": ["claude-mem:a"], "total": 2, "command": None},
+                {"plugin": "jev", "unused": ["jev:x"], "total": 1, "command": "claude plugin disable jev"},
+            ],
+        )
+
+    def test_skill_already_hidden_is_not_offered_again(self):
+        report = brain.unused_report(
+            {"skills": [self.skill("draft"), self.skill("spyt-sql")], "config": {"active_plugins": []}},
+            already_hidden={"spyt-sql"},
+        )
+        self.assertEqual([item["name"] for item in report["turn_off"]], ["draft"])
+
+    def test_archived_skill_is_left_out(self):
+        report = self.report([self.skill("old", level="archive")])
+        self.assertEqual((report["turn_off"], report["in_domain"], report["plugins"]), ([], [], []))
+
+
+class InventoryCacheTests(unittest.TestCase):
+    def test_inventory_built_by_an_older_engine_is_rebuilt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory) / "inventory.json"
+            data.write_text(json.dumps({"schema_version": "agent-brain.registry.v1", "source_snapshot": {}}), encoding="utf-8")
+            with mock.patch.object(brain, "DATA_PATH", data), mock.patch.object(
+                brain, "source_snapshot", return_value={}
+            ), mock.patch.object(brain, "build_outputs", return_value={"rebuilt": True}):
+                self.assertEqual(brain.load_or_build_inventory(), {"rebuilt": True})
+
+
+class RegistryHelpTests(unittest.TestCase):
+    def test_help_names_the_registry_brain_actually_reads(self):
+        with mock.patch.dict(os.environ, {"COLUMNS": "400"}):
+            self.assertIn(str(brain.DEFAULT_REGISTRY_DIR), brain.create_parser().format_help())
 
 
 if __name__ == "__main__":

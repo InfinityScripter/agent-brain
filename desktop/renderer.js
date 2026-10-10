@@ -721,9 +721,12 @@ function renderInspectorSkills(host) {
     if (skill.usage?.count) badges.push([`${skill.usage.count} calls`, '']);
     if (skill.override.effective) badges.push([`${skill.override.effective} @ ${skill.override.level}`, skill.override.effective === 'off' ? 'warn' : 'ok']);
     else if (!skill.active) badges.push(['out of context', '']);
+    // Claude Code ignores skillOverrides for plugin skills: only the whole plugin turns off.
+    const canToggle = skill.hideable !== false;
+    if (!canToggle) badges.push(['whole plugin only', '']);
     const row = harnessRow(
       skill.listed_name, skill.description, badges,
-      toggleButton('skill', skill.listed_name, skill.visible ? 'off' : 'on', skill.visible ? 'Off' : 'On')
+      canToggle ? toggleButton('skill', skill.listed_name, skill.visible ? 'off' : 'on', skill.visible ? 'Off' : 'On') : null
     );
     row.classList.toggle('off', !skill.visible);
     host.append(row);

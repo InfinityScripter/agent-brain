@@ -44,7 +44,8 @@ runtime explicit routing guidance:
 - `domain` — work, personal, creative, or any domain you define;
 - `project` — owned by one repository or product;
 - `plugin` — supplied by an installed plugin and activated explicitly;
-- `archive` — visible for diagnostics, never selected automatically.
+- `archive` — visible for diagnostics, never selected automatically, and
+  hidden from the model by `brain use` unless another copy is active.
 
 The same registry powers the CLI, runtime hooks, validation, visual graph, and
 the sandboxed Electron application.
@@ -122,7 +123,11 @@ domain, project, plugin, archive, or automatic source-based ownership.
 ./bin/brain explain <skill-name-or-id> --cwd /path/to/project
 ./bin/brain validate
 ./bin/brain use personal
+./bin/brain use personal --settings local --cwd /path/to/folder
+./bin/brain profile --cwd /path/to/folder
 ./bin/brain use auto
+./bin/brain prefs
+./bin/brain unused
 ./bin/brain serve
 ./bin/brain project update my-app --domain work
 ./bin/brain project dependencies my-app --json
@@ -132,12 +137,59 @@ domain, project, plugin, archive, or automatic source-based ownership.
 ./bin/brain skill scope project.my-app.review --level domain --domain work
 ```
 
-Use a custom registry directory with either:
+A clone whose `config/brain.json` exists is its own registry: `./bin/brain`
+run from it reads and writes that clone, not `~/.agent-brain`.
+`./bin/brain --help` prints the registry it uses. Use a custom registry
+directory with either:
 
 ```bash
 ./bin/brain --registry /path/to/registry status
 AGENT_BRAIN_HOME=/path/to/registry npm start
 ```
+
+`brain use <domain>` writes the profile to `~/.claude/settings.json`, so it
+changes every session. `--settings local --cwd <folder>` writes it to that
+folder's `.claude/settings.local.json` instead: Claude Code reads it only for
+sessions started in that exact folder, never in its subfolders. A folder
+profile applies the folder's own domain (what `brain status` shows there) and
+keeps its project's skills visible. Brain records
+what it hid, removes only its own entries on the next run, and `brain profile`
+prints one line when skills changed since. Claude Code ignores `skillOverrides`
+for plugin skills, so brain reports those instead of hiding them; `brain prefs`
+prints which copy to take when a plugin skill duplicates a personal one
+(`skill_preferences` in `config/brain.json`).
+
+## Claude Code mod
+
+`claude-mod/` is a Claude Code mod (a plugin of function hooks) that shows
+Agent Brain inside a session. `/brain` opens a pane with the folder's domain
+and why it was chosen, how many skills the model sees right now against what
+the domain's profile would hide, plugin skills that cannot be hidden one by
+one, duplicates from `skill_preferences`, this session's skill calls, and the
+folder advice from `brain recommend`. Every number comes from the `brain`
+CLI next to it (`../bin/brain`, or the path in `AGENT_BRAIN_BIN`); the mod
+has no routing logic of its own.
+
+- Writes go through `brain` only after you press **Выполнить** under the
+  exact command it will run: applying the domain profile to the folder, or
+  turning one skill off there.
+- At session start the mod runs `brain profile` in the background and shows
+  one toast only when the folder's profile is stale; nothing reaches the model.
+- When the model calls a plugin copy that `skill_preferences` replaces, the
+  mod hands it a short note to call the preferred skill instead. A skill you
+  type yourself as `/name` runs as is.
+
+The mod needs the engine, so install it from a clone:
+`claude plugin marketplace add /path/to/agent-brain`, then
+`claude plugin install agent-brain@agent-brain`. Such a plugin is read from
+the clone, so `/reload-plugins` picks up an edit. Installed from GitHub
+instead, the plugin cache holds only `claude-mod/`; set `AGENT_BRAIN_BIN` to
+your `bin/brain` first:
+
+```text
+/plugin install agent-brain --marketplace InfinityScripter/agent-brain
+``` Check and test it with
+`claude plugin validate claude-mod` and `claude plugin test claude-mod`.
 
 ## Registry model
 

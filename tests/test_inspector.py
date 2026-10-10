@@ -122,6 +122,30 @@ class HarnessInventoryTests(unittest.TestCase):
         self.assertNotIn("SECRET-VALUE", dumped)
         self.assertNotIn("TOP-SECRET", dumped)
 
+    def test_parent_folder_overrides_are_flagged_as_not_read_here(self):
+        parent_settings = self.home / "apps" / ".claude" / "settings.local.json"
+        self.write_settings(parent_settings, overrides={"review": "user-invocable-only", "deploy": "off"})
+        warnings = self.harness()["warnings"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(str(parent_settings.resolve()), warnings[0])
+
+    def test_session_in_a_project_subfolder_is_warned_about_the_project_settings(self):
+        self.inventory["projects"] = [{"id": "shop", "path": str(self.folder), "domain": "personal"}]
+        self.write_settings(self.folder / ".claude" / "settings.local.json", overrides={"review": "off"})
+        harness = brain.harness_inventory(self.folder / "web", self.inventory, home=self.home)
+        self.assertEqual(len(harness["warnings"]), 1)
+
+    def test_no_warning_without_parent_overrides(self):
+        self.assertEqual(self.harness()["warnings"], [])
+
+    def test_plugin_skill_stays_visible_whatever_its_override(self):
+        self.inventory["skills"].append(make_skill("tdd", level="plugin", plugin="superpowers"))
+        self.inventory["config"]["active_plugins"] = ["superpowers"]
+        self.write_settings(self.home / ".claude" / "settings.json", overrides={"superpowers:tdd": "off"})
+        tdd = next(item for item in self.harness()["skills"] if item["listed_name"] == "superpowers:tdd")
+        self.assertTrue(tdd["visible"])
+        self.assertFalse(tdd["hideable"])
+
     def test_explicit_on_override_makes_inactive_skill_visible(self):
         self.write_settings(self.folder / ".claude" / "settings.local.json", overrides={"deploy": "on"})
         deploy = next(item for item in self.harness()["skills"] if item["listed_name"] == "deploy")
@@ -189,6 +213,25 @@ class ToggleTests(unittest.TestCase):
     def test_toggle_skill_unknown_name_rejected(self):
         with self.assertRaises(ValueError):
             brain.toggle_skill("ghost", "off", self.settings, self.inventory)
+
+    def test_archived_skill_is_toggled_by_its_listed_name(self):
+        inventory = {"skills": [make_skill("old", level="archive")], "config": {}}
+        brain.toggle_skill("old", "off", self.settings, inventory)
+        self.assertEqual(json.loads(self.settings.read_text(encoding="utf-8"))["skillOverrides"], {"old": "off"})
+
+    def test_plugin_skill_toggle_is_refused_with_the_reason(self):
+        inventory = {
+            "skills": [make_skill("tdd", level="plugin", plugin="superpowers")],
+            "config": {"active_plugins": ["superpowers"]},
+        }
+        with self.assertRaisesRegex(ValueError, "whole plugin"):
+            brain.toggle_skill("superpowers:tdd", "off", self.settings, inventory)
+        self.assertFalse(self.settings.exists())
+
+    def test_copy_claude_code_does_not_load_is_unknown(self):
+        inventory = {"skills": [make_skill("typings", level="archive", loaded_runtimes=[])], "config": {}}
+        with self.assertRaisesRegex(ValueError, "Unknown skill"):
+            brain.toggle_skill("typings", "off", self.settings, inventory)
 
     def test_toggle_rule_roundtrip(self):
         rules_dir = self.root / "rules"

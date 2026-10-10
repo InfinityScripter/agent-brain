@@ -259,6 +259,116 @@ class AgentBrainCliTests(unittest.TestCase):
             self.assertEqual(self.run_brain(home, registry, "project", "delete", "sample", "--cascade").returncode, 0)
             self.assertEqual(self.run_brain(home, registry, "domain", "delete", "work.studio").returncode, 0)
 
+    def test_folder_profile_apply_check_and_reset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            registry = home / ".agent-brain"
+            notes = home / "notes"
+            notes.mkdir()
+            local = notes / ".claude" / "settings.local.json"
+            for name in ("deploy", "release"):
+                (home / ".claude" / "skills" / name).mkdir(parents=True)
+            (home / ".claude" / "skills" / "deploy" / "SKILL.md").write_text("---\nname: deploy\ndescription: d\n---\n", encoding="utf-8")
+            self.assertEqual(self.run_brain(home, registry, "init").returncode, 0)
+            config_path = registry / "config" / "brain.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["skill_scope_rules"] = [{"names": ["deploy", "release"], "level": "domain", "domain": "work"}]
+            config["domain_path_rules"].append({"path": str(notes), "domain": "personal"})
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+
+            foreign = self.run_brain(home, registry, "use", "work", "--settings", "local", "--cwd", str(notes))
+            self.assertEqual(foreign.returncode, 2)
+            self.assertIn("resolves to personal", foreign.stderr)
+            dry = self.run_brain(home, registry, "use", "personal", "--settings", "local", "--cwd", str(notes), "--dry-run", "--json")
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            self.assertEqual(json.loads(dry.stdout)["hide"], ["deploy"])
+            self.assertFalse(local.exists())
+
+            applied = self.run_brain(home, registry, "use", "personal", "--settings", "local", "--cwd", str(notes))
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            self.assertEqual(json.loads(local.read_text(encoding="utf-8"))["skillOverrides"], {"deploy": "user-invocable-only"})
+            self.assertFalse((registry / "state" / "active-context.json").exists())
+            fresh = self.run_brain(home, registry, "profile", "--cwd", str(notes))
+            self.assertEqual((fresh.returncode, fresh.stdout), (0, ""), fresh.stderr)
+
+            (home / ".claude" / "skills" / "release" / "SKILL.md").write_text("---\nname: release\ndescription: d\n---\n", encoding="utf-8")
+            stale = self.run_brain(home, registry, "profile", "--cwd", str(notes))
+            self.assertEqual(stale.returncode, 0, stale.stderr)
+            self.assertEqual(len(stale.stdout.splitlines()), 1)
+            self.assertIn(f"brain use personal --settings local --cwd {notes.resolve()}", stale.stdout)
+            self.assertTrue(json.loads(self.run_brain(home, registry, "profile", "--cwd", str(notes), "--json").stdout)["stale"])
+
+            reset = self.run_brain(home, registry, "use", "auto", "--settings", "local", "--cwd", str(notes))
+            self.assertEqual(reset.returncode, 0, reset.stderr)
+            self.assertNotIn("skillOverrides", json.loads(local.read_text(encoding="utf-8")))
+            self.assertIsNone(json.loads(self.run_brain(home, registry, "profile", "--cwd", str(notes), "--json").stdout)["applied"])
+
+    def test_use_auto_dry_run_and_unrecorded_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            registry = home / ".agent-brain"
+            notes = home / "notes"
+            notes.mkdir()
+            self.assertEqual(self.run_brain(home, registry, "init").returncode, 0)
+            settings = home / ".claude" / "settings.json"
+            settings.parent.mkdir(parents=True)
+            settings.write_text(json.dumps({"skillOverrides": {"menu-choice": "user-invocable-only"}}), encoding="utf-8")
+            self.assertEqual(self.run_brain(home, registry, "use", "personal").returncode, 0)
+            state = registry / "state" / "active-context.json"
+            self.assertTrue(state.exists())
+
+            dry = self.run_brain(home, registry, "use", "auto", "--dry-run")
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            self.assertTrue(state.exists())
+
+            reset = self.run_brain(home, registry, "use", "auto")
+            self.assertIn("1 hidden entries brain has no record of writing stay", reset.stdout)
+            self.assertEqual(json.loads(settings.read_text(encoding="utf-8"))["skillOverrides"], {"menu-choice": "user-invocable-only"})
+
+            untouched = self.run_brain(home, registry, "use", "auto", "--settings", "local", "--cwd", str(notes))
+            self.assertEqual(untouched.returncode, 0, untouched.stderr)
+            self.assertFalse((notes / ".claude").exists())
+
+    def test_prefs_prints_the_table_and_marks_where_each_row_applies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            registry = home / ".agent-brain"
+            self.assertEqual(self.run_brain(home, registry, "init").returncode, 0)
+            config_path = registry / "config" / "brain.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["skill_preference_headers"] = ["Задача", "Беру", "Не беру следом"]
+            config["skill_preferences"] = [
+                {"task": "Тесты до кода", "use": "test-driven-development", "instead_of": ["superpowers:test-driven-development"], "except_domains": ["personal"]},
+            ]
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+
+            table = self.run_brain(home, registry, "prefs")
+            scoped = self.run_brain(home, registry, "prefs", "--json", "--domain", "personal")
+
+            self.assertEqual(table.returncode, 0, table.stderr)
+            self.assertIn("| Тесты до кода | `test-driven-development` | `superpowers:test-driven-development` |", table.stdout)
+            self.assertEqual(scoped.returncode, 0, scoped.stderr)
+            payload = json.loads(scoped.stdout)
+            self.assertEqual(payload["domain"], "personal")
+            self.assertEqual([row["applies"] for row in payload["preferences"]], [False])
+
+    def test_archived_skill_scope_is_reset_by_its_listed_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            registry = home / ".agent-brain"
+            skill = home / ".claude" / "skills" / "drafts"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("---\nname: drafts\ndescription: d\n---\n", encoding="utf-8")
+            self.assertEqual(self.run_brain(home, registry, "init").returncode, 0)
+            archived = self.run_brain(home, registry, "skill", "scope", "global.drafts", "--level", "archive")
+            self.assertEqual(archived.returncode, 0, archived.stderr)
+
+            restored = self.run_brain(home, registry, "skill", "scope", "drafts", "--level", "auto")
+
+            self.assertEqual(restored.returncode, 0, restored.stderr)
+            inventory = json.loads((registry / "data" / "inventory.json").read_text(encoding="utf-8"))
+            self.assertTrue(any(item["id"] == "global.drafts" for item in inventory["skills"]))
+
 
 if __name__ == "__main__":
     unittest.main()

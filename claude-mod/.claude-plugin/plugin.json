@@ -1,0 +1,7 @@
+{
+  "name": "agent-brain",
+  "version": "0.1.0",
+  "description": "Agent Brain inside Claude Code: the folder's domain, which skills the model sees and which brain would hide, duplicates and skill calls, in a /brain pane",
+  "types": "./types/index.d.ts",
+  "author": { "name": "InfinityScripter" }
+}

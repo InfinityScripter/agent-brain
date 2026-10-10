@@ -1,0 +1,13 @@
+{
+  "name": "agent-brain",
+  "description": "Agent Brain mod for Claude Code: the folder's domain, visible and hidden skills, duplicates and skill calls",
+  "owner": {
+    "name": "InfinityScripter"
+  },
+  "plugins": [
+    {
+      "name": "agent-brain",
+      "source": "./claude-mod"
+    }
+  ]
+}
